@@ -68,8 +68,10 @@ applies them within ~1 s.
 
 Drop an image at `~/.config/beacn-mix-linux/background.{png,jpg,jpeg}` and the
 gauges are drawn over it (cover-scaled to 800×480 and darkened for legibility);
-remove it to go back to the solid colour. It's loaded once at startup, so restart
-the daemon after changing it. Tune the darkening via `SCRIM` in `src/screen.rs`.
+remove it to go back to the solid colour. The daemon loads it once at startup —
+after swapping the file, open `beacn-mix tui`, go to the **Settings** page, select
+**Reload background**, and press `Enter` to have the running daemon re-read it
+within ~1 s (no restart needed). Tune the darkening via `SCRIM` in `src/screen.rs`.
 
 ## Permissions
 

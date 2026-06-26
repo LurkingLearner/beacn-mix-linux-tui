@@ -142,6 +142,12 @@ pub struct DisplayConfig {
     /// Optional custom label per channel; empty falls back to "CH n".
     #[serde(default)]
     pub channel_names: [String; 4],
+    /// Bumped by the TUI to ask the daemon to reload the backdrop image from
+    /// disk (the daemon loads it once at startup, so this is the on-demand
+    /// "refresh background" signal). The value itself is meaningless — only a
+    /// change matters.
+    #[serde(default)]
+    pub background_generation: u64,
 }
 
 impl Default for DisplayConfig {
@@ -151,6 +157,7 @@ impl Default for DisplayConfig {
             full_brightness: 80,
             dim_brightness: 12,
             channel_names: std::array::from_fn(|_| String::new()),
+            background_generation: 0,
         }
     }
 }

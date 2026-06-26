@@ -35,10 +35,13 @@ const ACCENT: [Color; 4] = [
     Color::Rgb(190, 130, 240), // violet
 ];
 
-/// Settings rows: dim-after, full brightness, dim brightness, then 4 channel names.
-const SETTINGS_FIELDS: usize = 7;
+/// Settings rows: dim-after, full brightness, dim brightness, 4 channel names,
+/// then the "reload background" action button.
+const SETTINGS_FIELDS: usize = 8;
 /// Index of the first channel-name row (rows below this are numeric).
 const NAME_FIELD_BASE: usize = 3;
+/// Index of the "reload background" action row (just past the 4 name rows).
+const REFRESH_FIELD: usize = NAME_FIELD_BASE + 4;
 /// Max length of a custom channel name.
 const NAME_MAX: usize = 16;
 
@@ -322,7 +325,10 @@ fn handle_routing_key(app: &mut App, code: KeyCode) {
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
-    let is_name = field >= NAME_FIELD_BASE;
+    let is_name = (NAME_FIELD_BASE..REFRESH_FIELD).contains(&field);
+    let is_button = field == REFRESH_FIELD;
+    // Numeric (adjustable) rows are everything that isn't a name or the button.
+    let is_numeric = !is_name && !is_button;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -334,11 +340,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.status.clear();
         }
         // Numeric fields adjust with ←/→; name fields are typed (Enter to start).
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') if !is_name => {
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') if is_numeric => {
             save_adjust(app, field, -1)
         }
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=')
-            if !is_name =>
+            if is_numeric =>
         {
             save_adjust(app, field, 1)
         }
@@ -346,8 +352,25 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.editing = true;
             app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
         }
+        KeyCode::Enter if is_button => request_background_reload(app),
         _ => {}
     }
+}
+
+/// Signal the daemon to reload the backdrop image: bump the generation counter and
+/// save `display.json`. The daemon notices the change within ~1s and re-reads the
+/// `background.{png,jpg,jpeg}` from the config dir.
+fn request_background_reload(app: &mut App) {
+    app.display.background_generation = app.display.background_generation.wrapping_add(1);
+    app.status = match app.display.save() {
+        Ok(()) => match crate::state::background_path() {
+            Some(_) => "Reloading background — the daemon applies it within ~1s.".to_string(),
+            None => {
+                "No background.{png,jpg,jpeg} in the config dir — using solid colour.".to_string()
+            }
+        },
+        Err(e) => format!("Save failed: {e}"),
+    };
 }
 
 /// Text entry into the selected channel-name field.
@@ -505,6 +528,16 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         }
         items.push(field_item(&format!("Channel {} name", i + 1), val));
     }
+    // Action row: reload the panel backdrop from disk on demand.
+    let bg_hint = match crate::state::background_path() {
+        Some(p) => p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("set")
+            .to_string(),
+        None => "no file found".to_string(),
+    };
+    items.push(field_item("Reload background", format!("⏎  ({bg_hint})")));
     let list = List::new(items)
         .block(Block::bordered().title(" Panel display "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -513,6 +546,8 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
 
     let help = if !app.status.is_empty() {
         app.status.clone()
+    } else if sel == REFRESH_FIELD {
+        "↑/↓ select · Enter reload background · Tab routing · q quit".to_string()
     } else if sel >= NAME_FIELD_BASE {
         "↑/↓ select · Enter rename · Tab routing · q quit".to_string()
     } else {

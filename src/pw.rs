@@ -125,6 +125,20 @@ pub fn set_mute(ch: Channel, mute: bool) -> Result<()> {
     Ok(())
 }
 
+/// Set a source's (mic's) volume as a percentage (0..=150). Unlike the channel
+/// sinks, this rides the *real* capture device, so it behaves like a hardware
+/// gain knob — every app recording from `source` is affected.
+pub fn set_source_volume(source: &str, percent: u32) -> Result<()> {
+    pactl(&["set-source-volume", source, &format!("{percent}%")])?;
+    Ok(())
+}
+
+/// Mute / unmute a source (mic) at the device level.
+pub fn set_source_mute(source: &str, mute: bool) -> Result<()> {
+    pactl(&["set-source-mute", source, if mute { "1" } else { "0" }])?;
+    Ok(())
+}
+
 /// Route a playback stream (sink-input) onto a channel.
 pub fn move_stream(stream_index: u32, ch: Channel) -> Result<()> {
     pactl(&["move-sink-input", &stream_index.to_string(), &sink_name(ch)])?;
@@ -250,4 +264,133 @@ fn prop(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?.trim_start();
     let rest = rest.strip_prefix('=')?.trim();
     Some(rest.trim_matches('"').to_owned())
+}
+
+/// A capture device (mic) — a real PipeWire *source*, not a monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// The node name pactl uses to address it (e.g. `alsa_input.pci-...`).
+    pub name: String,
+    /// Friendly description for display (e.g. "Yeti Stereo Microphone").
+    pub description: String,
+}
+
+impl Source {
+    /// What to show the user: the friendly description, or the raw name as a
+    /// fallback when the device exposes no description.
+    pub fn label(&self) -> &str {
+        if self.description.is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
+}
+
+/// Enumerate real capture devices (mics) by parsing verbose `pactl list sources`,
+/// skipping sink monitors (our channel loopbacks and every other sink's `.monitor`).
+pub fn list_sources() -> Result<Vec<Source>> {
+    Ok(parse_sources(&pactl(&["list", "sources"])?))
+}
+
+/// Pure parser for `pactl list sources`, split out so it can be unit-tested
+/// without a running PipeWire. A source is dropped when it is a monitor of a
+/// sink (`Monitor of Sink:` is anything but `n/a`, with a `.monitor` name
+/// fallback for pactl variants that omit the line).
+fn parse_sources(text: &str) -> Vec<Source> {
+    let mut sources = Vec::new();
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut is_monitor = false;
+
+    let flush =
+        |sources: &mut Vec<Source>, name: &mut String, desc: &mut String, mon: &mut bool| {
+            let n = std::mem::take(name);
+            let d = std::mem::take(desc);
+            let monitor = std::mem::replace(mon, false);
+            if !n.is_empty() && !monitor && !n.ends_with(".monitor") {
+                sources.push(Source {
+                    name: n,
+                    description: d,
+                });
+            }
+        };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Source #") {
+            flush(&mut sources, &mut name, &mut description, &mut is_monitor);
+        } else if let Some(v) = trimmed.strip_prefix("Name: ") {
+            // First (top-level) Name per block wins; ignore any later ones.
+            if name.is_empty() {
+                name = v.trim().to_owned();
+            }
+        } else if let Some(v) = trimmed.strip_prefix("Description: ") {
+            if description.is_empty() {
+                description = v.trim().to_owned();
+            }
+        } else if let Some(v) = trimmed.strip_prefix("Monitor of Sink: ") {
+            if v.trim() != "n/a" {
+                is_monitor = true;
+            }
+        }
+    }
+    flush(&mut sources, &mut name, &mut description, &mut is_monitor);
+    sources
+}
+
+#[cfg(test)]
+mod tests {
+    //! Only the pure `pactl list sources` parser is exercised here — the rest of
+    //! this module shells out to a live PipeWire, which the unit tests can't.
+
+    use super::*;
+
+    // Trimmed-down but realistic `pactl list sources` output: one real mic, one
+    // sink monitor (must be filtered), and one of our own channel-loopback
+    // monitors (also filtered, via the `.monitor` name fallback).
+    const SAMPLE: &str = r#"
+Source #50
+        State: SUSPENDED
+        Name: alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo
+        Description: Yeti Stereo Microphone
+        Monitor of Sink: n/a
+        Properties:
+                device.description = "Yeti Stereo Microphone"
+Source #51
+        State: RUNNING
+        Name: alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
+        Description: Monitor of Built-in Audio
+        Monitor of Sink: alsa_output.pci-0000_00_1f.3.analog-stereo
+Source #77
+        State: IDLE
+        Name: BeacnCh1.monitor
+        Description: Monitor of Beacn_Channel_1
+"#;
+
+    #[test]
+    fn parse_sources_keeps_real_mics_and_drops_monitors() {
+        let got = parse_sources(SAMPLE);
+        assert_eq!(got.len(), 1, "only the real mic should survive");
+        assert_eq!(
+            got[0].name,
+            "alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo"
+        );
+        assert_eq!(got[0].description, "Yeti Stereo Microphone");
+        assert_eq!(got[0].label(), "Yeti Stereo Microphone");
+    }
+
+    #[test]
+    fn parse_sources_handles_empty_input() {
+        assert!(parse_sources("").is_empty());
+    }
+
+    #[test]
+    fn source_label_falls_back_to_name_without_description() {
+        let s = Source {
+            name: "alsa_input.thing".into(),
+            description: String::new(),
+        };
+        assert_eq!(s.label(), "alsa_input.thing");
+    }
 }

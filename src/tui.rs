@@ -51,8 +51,9 @@ enum Page {
     Settings,
 }
 
-/// One manageable entry: either a live playback stream or an app that's bound to
-/// a channel but isn't currently playing.
+/// One manageable entry: a live playback stream, an app that's bound to a
+/// channel but isn't currently playing, or a capture device (mic) that can ride
+/// a channel's gain.
 #[derive(Clone)]
 enum Row {
     Live {
@@ -65,18 +66,28 @@ enum Row {
         app: String,
         channel: Channel,
     },
+    Mic {
+        /// Source node name (the pactl handle).
+        name: String,
+        /// Friendly description for display.
+        label: String,
+        /// Channel this mic is currently bound to, if any.
+        channel: Option<Channel>,
+    },
 }
 
 impl Row {
+    /// A short human label for status messages.
     fn app(&self) -> &str {
         match self {
             Row::Live { app, .. } | Row::Idle { app, .. } => app,
+            Row::Mic { label, .. } => label,
         }
     }
 
     fn channel(&self) -> Option<Channel> {
         match self {
-            Row::Live { channel, .. } => *channel,
+            Row::Live { channel, .. } | Row::Mic { channel, .. } => *channel,
             Row::Idle { channel, .. } => Some(*channel),
         }
     }
@@ -84,7 +95,7 @@ impl Row {
     fn stream_index(&self) -> Option<u32> {
         match self {
             Row::Live { index, .. } => Some(*index),
-            Row::Idle { .. } => None,
+            Row::Idle { .. } | Row::Mic { .. } => None,
         }
     }
 
@@ -97,6 +108,7 @@ impl Row {
         match self {
             Row::Live { label, .. } => format!("[{ch}] {label}"),
             Row::Idle { app, .. } => format!("[{ch}] {app} (idle)"),
+            Row::Mic { label, .. } => format!("[{ch}] {label} (mic)"),
         }
     }
 }
@@ -133,26 +145,60 @@ fn snapshot() -> Snapshot {
         }
     }
 
+    // Capture devices (mics): one row each, showing which channel (if any) they
+    // ride. Selecting one + 1-4 binds it so that channel's encoder rides its gain.
+    let mics = pw::list_sources().unwrap_or_default();
+    let present: HashSet<&str> = mics.iter().map(|m| m.name.as_str()).collect();
+    for m in &mics {
+        rows.push(Row::Mic {
+            name: m.name.clone(),
+            label: m.label().to_string(),
+            channel: bindings.channel_for_mic(&m.name),
+        });
+    }
+    // Bound mics whose device isn't currently present (e.g. a wireless mic that's
+    // detached) — still show them so they can be unbound.
+    for (name, &ch) in &bindings.mic_by_source {
+        if !present.contains(name.as_str()) {
+            rows.push(Row::Mic {
+                name: name.clone(),
+                label: name.clone(),
+                channel: Some(Channel(ch)),
+            });
+        }
+    }
+
     Snapshot { rows, levels }
 }
 
-/// Bind a row to a channel: move its live stream (if any) and persist the binding.
+/// Bind a row to a channel: move its live stream (if any) and persist the
+/// binding. For a mic there's no graph move — we just persist the binding and the
+/// daemon starts riding that mic's gain on the channel within ~1s.
 fn assign(row: &Row, ch: Channel) -> Result<()> {
+    let mut bindings = Bindings::load().unwrap_or_default();
+    if let Row::Mic { name, .. } = row {
+        bindings.set_mic(ch, name);
+        return bindings.save();
+    }
     if let Some(idx) = row.stream_index() {
         pw::move_stream(idx, ch)?;
     }
-    let mut bindings = Bindings::load().unwrap_or_default();
     bindings.set(row.app(), ch);
     bindings.save()
 }
 
-/// Drop a row's binding and move its live stream back to the default output.
+/// Drop a row's binding. For an app, move its live stream back to the default
+/// output; for a mic, just clear the binding (the daemon stops riding its gain).
 fn unassign(row: &Row) -> Result<()> {
+    let mut bindings = Bindings::load().unwrap_or_default();
+    if let Row::Mic { name, .. } = row {
+        bindings.remove_mic(name);
+        return bindings.save();
+    }
     if let Some(idx) = row.stream_index() {
         let default = pw::default_sink()?;
         pw::move_to_sink(idx, &default)?;
     }
-    let mut bindings = Bindings::load().unwrap_or_default();
     bindings.remove(row.app());
     bindings.save()
 }
@@ -464,6 +510,10 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
                         format!("{app} (idle)"),
                         Style::new().fg(Color::DarkGray),
                     )),
+                    Row::Mic { label, .. } => lines.push(Line::styled(
+                        format!("mic: {label}"),
+                        Style::new().fg(ACCENT[i]),
+                    )),
                 }
             }
         }
@@ -485,7 +535,7 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|r| ListItem::new(r.display()))
         .collect();
     let list = List::new(items)
-        .block(Block::bordered().title(" Streams — select, then 1-4 to assign "))
+        .block(Block::bordered().title(" Streams & mics — select, then 1-4 to assign "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[1], &mut app.routing);

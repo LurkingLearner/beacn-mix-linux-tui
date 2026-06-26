@@ -151,11 +151,19 @@ fn save_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// app name -> channel index (0..=3).
+/// Routing bindings: which app plays on which channel (output side), and which
+/// mics a channel rides the gain of (input side).
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Bindings {
+    /// app name -> channel index (0..=3).
     #[serde(default)]
     pub by_app: BTreeMap<String, usize>,
+    /// capture-device (mic) node name -> channel index (0..=3). Keyed by source
+    /// (like `by_app`) so a channel can hold *several* mics — e.g. a hardwired
+    /// mic and a wireless one you swap between. The channel's encoder rides every
+    /// bound mic's gain/mute; absent ones simply no-op until they reappear.
+    #[serde(default)]
+    pub mic_by_source: BTreeMap<String, usize>,
 }
 
 impl Bindings {
@@ -187,6 +195,38 @@ impl Bindings {
             .filter(|(_, &c)| c == ch.0)
             .map(|(app, _)| app.clone())
             .collect()
+    }
+
+    /// Bind a mic (source node name) to a channel so its encoder rides the mic's
+    /// gain. A given mic lives on at most one channel, so re-binding it just moves
+    /// it; binding a second mic to a channel that already has one keeps both.
+    pub fn set_mic(&mut self, ch: Channel, source: &str) {
+        self.mic_by_source.insert(source.to_owned(), ch.0);
+    }
+
+    /// Which channel a mic is bound to, if any.
+    pub fn channel_for_mic(&self, source: &str) -> Option<Channel> {
+        self.mic_by_source.get(source).copied().map(Channel)
+    }
+
+    /// Drop a single mic's binding (by source node name).
+    pub fn remove_mic(&mut self, source: &str) {
+        self.mic_by_source.remove(source);
+    }
+
+    /// All mics bound to a channel, in stable (source-name) order.
+    pub fn mics_for_channel(&self, ch: Channel) -> Vec<String> {
+        self.mic_by_source
+            .iter()
+            .filter(|(_, &c)| c == ch.0)
+            .map(|(src, _)| src.clone())
+            .collect()
+    }
+
+    /// Per-channel mic bindings as a fixed array, for the daemon to ride every
+    /// bound mic on a channel (or its sink when the list is empty).
+    pub fn mics_array(&self) -> [Vec<String>; 4] {
+        std::array::from_fn(|i| self.mics_for_channel(Channel(i)))
     }
 }
 
@@ -351,6 +391,57 @@ mod tests {
             b2.remove("Spotify");
             assert_eq!(b2.channel_for_app("Spotify"), None);
             assert_eq!(b2.apps_for_channel(Channel(0)).len(), 1);
+        });
+    }
+
+    #[test]
+    fn mic_bindings_roundtrip_with_multiple_mics_per_channel() {
+        let p = temp_paths();
+        with_paths(p.clone(), || {
+            let mut b = Bindings::load().expect("load default");
+            assert!(b.mics_for_channel(Channel(3)).is_empty());
+
+            // Two mics on the same channel (the swap-between-devices case), plus
+            // a third mic and an app elsewhere.
+            b.set_mic(Channel(3), "alsa_input.snowball");
+            b.set_mic(Channel(3), "alsa_input.antlion");
+            b.set_mic(Channel(0), "alsa_input.webcam");
+            b.set("Firefox", Channel(3)); // a mic and an app can share a channel
+            b.save().expect("save");
+        });
+
+        with_paths(p, || {
+            let mut b = Bindings::load().expect("reload");
+            // Both mics live on channel 3, in stable (alphabetical) order.
+            assert_eq!(
+                b.mics_for_channel(Channel(3)),
+                vec![
+                    "alsa_input.antlion".to_string(),
+                    "alsa_input.snowball".to_string()
+                ]
+            );
+            assert_eq!(b.channel_for_mic("alsa_input.webcam"), Some(Channel(0)));
+            // App binding on the same channel is untouched by the mic bindings.
+            assert_eq!(b.channel_for_app("Firefox"), Some(Channel(3)));
+
+            // mics_array carries the full per-channel lists.
+            let arr = b.mics_array();
+            assert_eq!(arr[3].len(), 2);
+            assert_eq!(arr[0], vec!["alsa_input.webcam".to_string()]);
+            assert!(arr[1].is_empty());
+
+            // Re-binding one mic to a new channel moves only that mic.
+            b.set_mic(Channel(1), "alsa_input.snowball");
+            assert_eq!(b.channel_for_mic("alsa_input.snowball"), Some(Channel(1)));
+            assert_eq!(
+                b.mics_for_channel(Channel(3)),
+                vec!["alsa_input.antlion".to_string()]
+            );
+
+            // Removing a mic only drops that one.
+            b.remove_mic("alsa_input.antlion");
+            assert!(b.mics_for_channel(Channel(3)).is_empty());
+            assert_eq!(b.channel_for_mic("alsa_input.snowball"), Some(Channel(1)));
         });
     }
 

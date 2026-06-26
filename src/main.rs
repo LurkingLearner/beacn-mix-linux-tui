@@ -98,24 +98,28 @@ fn cmd_preview(path: &str) -> Result<()> {
             volume: 100,
             muted: false,
             apps: vec!["Firefox".into(), "YouTube Music".into()],
+            is_mic: false,
         },
         ChannelView {
             label: "Chat".into(),
             volume: 90,
             muted: true,
             apps: vec!["Discord".into(), "Zoom".into()],
+            is_mic: false,
         },
         ChannelView {
             label: "Music".into(),
             volume: 52,
             muted: false,
             apps: vec!["Spotify".into()],
+            is_mic: false,
         },
         ChannelView {
-            label: "CH 4".into(),
+            label: "Mic".into(),
             volume: 75,
             muted: false,
-            apps: vec![],
+            apps: vec!["Yeti Microphone".into()],
+            is_mic: true,
         },
     ];
     let background = state::background_path().and_then(|p| screen::load_background(&p));
@@ -198,13 +202,17 @@ fn cmd_assign() -> Result<()> {
 fn cmd_run() -> Result<()> {
     cmd_setup()?;
 
-    // Restore the channel levels/mutes from the last session.
+    // Per-channel mic bindings: when a channel has one, its encoder rides that
+    // capture device's gain/mute instead of the output sink. Re-read live below.
+    let mut mics = mic_bindings();
+
+    // Restore the channel levels/mutes from the last session, applying each to
+    // whatever the channel currently drives (its mic, or its sink).
     let saved = Levels::load().unwrap_or_default();
     let mut volumes = saved.volumes;
     let mut mutes = saved.mutes;
     for ch in Channel::ALL {
-        pw::set_volume(ch, volumes[ch.0])?;
-        pw::set_mute(ch, mutes[ch.0])?;
+        apply_level(ch, &mics, volumes[ch.0], mutes[ch.0]);
     }
 
     // Background: keep app streams routed to their bound channels.
@@ -233,13 +241,14 @@ fn cmd_run() -> Result<()> {
     let mut display = DisplayConfig::load().unwrap_or_default();
     mix.as_ref().unwrap().init_display(display.full_brightness);
 
-    let mut sources = channel_sources();
+    let mut sources = channel_sources(&mics);
     let _ = refresh_screen(
         mix.as_ref().unwrap(),
         &display,
         &sources,
         &volumes,
         &mutes,
+        &mics,
         background.as_ref(),
     );
 
@@ -293,6 +302,7 @@ fn cmd_run() -> Result<()> {
                             &sources,
                             &volumes,
                             &mutes,
+                            &mics,
                             background.as_ref(),
                         ) {
                             log::warn!("post-reconnect screen push failed: {e:#}");
@@ -339,22 +349,16 @@ fn cmd_run() -> Result<()> {
                             let ch = channel_for_dial(dial);
                             let next = (volumes[ch.0] as i32 + delta as i32 * VOLUME_STEP).clamp(0, VOLUME_MAX);
                             volumes[ch.0] = next as u32;
-                            if let Err(e) = pw::set_volume(ch, volumes[ch.0]) {
-                                log::warn!("set volume failed: {e}");
-                            } else {
-                                log::info!("channel {} -> {}%", ch.human(), volumes[ch.0]);
-                            }
+                            set_channel_volume(ch, &mics, volumes[ch.0]);
+                            log::info!("channel {} -> {}%", ch.human(), volumes[ch.0]);
                             dirty = true;
                             levels_dirty = true;
                         }
                         Interactions::ButtonPress(button, ButtonState::Press) => {
                             if let Some(ch) = channel_for_button(button) {
                                 mutes[ch.0] = !mutes[ch.0];
-                                if let Err(e) = pw::set_mute(ch, mutes[ch.0]) {
-                                    log::warn!("set mute failed: {e}");
-                                } else {
-                                    log::info!("channel {} {}", ch.human(), if mutes[ch.0] { "muted" } else { "unmuted" });
-                                }
+                                set_channel_mute(ch, &mics, mutes[ch.0]);
+                                log::info!("channel {} {}", ch.human(), if mutes[ch.0] { "muted" } else { "unmuted" });
                                 dirty = true;
                                 levels_dirty = true;
                             }
@@ -388,7 +392,7 @@ fn cmd_run() -> Result<()> {
                 last_tick = now;
 
                 if dirty {
-                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, background.as_ref()) {
+                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, background.as_ref()) {
                         // Transport failure = the device is gone. Anything else
                         // (e.g. a JPEG decoder hiccup) is logged inside refresh_screen.
                         log::warn!("screen update failed: {e}");
@@ -406,7 +410,19 @@ fn cmd_run() -> Result<()> {
                 // TUI assign/unassign) and re-read the display config (so Settings
                 // edits apply live). A routing change also counts as activity.
                 if ticks.is_multiple_of(7) {
-                    let next = channel_sources();
+                    // Re-read mic bindings; if they changed (TUI assign/unassign),
+                    // re-apply the channels' levels to their new targets so the
+                    // newly-bound mic immediately tracks the saved gain/mute.
+                    let next_mics = mic_bindings();
+                    if next_mics != mics {
+                        mics = next_mics;
+                        for ch in Channel::ALL {
+                            apply_level(ch, &mics, volumes[ch.0], mutes[ch.0]);
+                        }
+                        dirty = true;
+                    }
+
+                    let next = channel_sources(&mics);
                     if next != sources {
                         sources = next;
                         dirty = true;
@@ -486,6 +502,7 @@ fn refresh_screen(
     sources: &[Vec<String>; 4],
     volumes: &[u32; 4],
     mutes: &[bool; 4],
+    mics: &[Vec<String>; 4],
     background: Option<&RgbImage>,
 ) -> Result<()> {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
@@ -493,6 +510,7 @@ fn refresh_screen(
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),
+        is_mic: !mics[i].is_empty(),
     });
     let jpeg = match screen::render(&views, background) {
         Ok(j) => j,
@@ -509,11 +527,31 @@ fn refresh_screen(
 /// app (e.g. two Firefox windows) each show on their own channel instead of
 /// colliding on one binding key. Falls back to the bound-but-idle app names when
 /// nothing is playing on a channel.
-fn channel_sources() -> [Vec<String>; 4] {
+fn channel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
     let streams = pw::app_streams().unwrap_or_default();
     let bindings = Bindings::load().unwrap_or_default();
+    // Resolve mic node names to friendly descriptions, but only pay for the
+    // `pactl list sources` call when at least one channel actually has a mic.
+    let source_list = if mics.iter().any(|m| !m.is_empty()) {
+        pw::list_sources().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     std::array::from_fn(|i| {
         let ch = Channel(i);
+        // A mic channel shows its mics' names (the encoder rides all of them).
+        if !mics[i].is_empty() {
+            return mics[i]
+                .iter()
+                .map(|name| {
+                    source_list
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .map(|s| s.label().to_string())
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect();
+        }
         let live: Vec<String> = streams
             .iter()
             .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
@@ -525,6 +563,52 @@ fn channel_sources() -> [Vec<String>; 4] {
             live
         }
     })
+}
+
+/// The per-channel mic bindings (channel -> the capture devices riding it).
+fn mic_bindings() -> [Vec<String>; 4] {
+    Bindings::load().unwrap_or_default().mics_array()
+}
+
+/// Apply a channel's volume to whatever it currently drives: every bound mic's
+/// gain (input), or its output sink. A channel may hold several mics (e.g. a
+/// hardwired one and a wireless one you swap between) — we set them all, and a
+/// mic that's currently absent simply fails its `pactl` call (logged at debug,
+/// not propagated, so an unplugged mic never takes down the daemon).
+fn set_channel_volume(ch: Channel, mics: &[Vec<String>; 4], percent: u32) {
+    if mics[ch.0].is_empty() {
+        if let Err(e) = pw::set_volume(ch, percent) {
+            log::warn!("channel {} set volume failed: {e}", ch.human());
+        }
+    } else {
+        for source in &mics[ch.0] {
+            if let Err(e) = pw::set_source_volume(source, percent) {
+                log::debug!("mic '{source}' volume failed (absent?): {e}");
+            }
+        }
+    }
+}
+
+/// Apply a channel's mute to all its bound mics, or its output sink.
+fn set_channel_mute(ch: Channel, mics: &[Vec<String>; 4], mute: bool) {
+    if mics[ch.0].is_empty() {
+        if let Err(e) = pw::set_mute(ch, mute) {
+            log::warn!("channel {} set mute failed: {e}", ch.human());
+        }
+    } else {
+        for source in &mics[ch.0] {
+            if let Err(e) = pw::set_source_mute(source, mute) {
+                log::debug!("mic '{source}' mute failed (absent?): {e}");
+            }
+        }
+    }
+}
+
+/// Push both volume and mute for a channel to its current target(s) (mics or
+/// sink). Used on startup and when a mic binding changes.
+fn apply_level(ch: Channel, mics: &[Vec<String>; 4], volume: u32, mute: bool) {
+    set_channel_volume(ch, mics, volume);
+    set_channel_mute(ch, mics, mute);
 }
 
 /// Longest `media.name` we'll show in place of the app name on the panel. Above

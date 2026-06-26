@@ -62,7 +62,11 @@ pub struct ChannelView {
     pub volume: u32,
     pub muted: bool,
     /// Source apps grouped on this channel (top-to-bottom). Empty = unbound.
+    /// For a mic channel this holds the single mic's name.
     pub apps: Vec<String>,
+    /// True when this channel rides a mic's gain (input) rather than a sink
+    /// (output): draws a mic marker, and a mic glyph for the mute icon.
+    pub is_mic: bool,
 }
 
 /// Load a backdrop image, scaled to cover 800×480 and darkened for legibility.
@@ -118,6 +122,12 @@ pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Re
         }
 
         draw_gauge(&mut img, &font, cx, view, accent);
+
+        // Small mic marker above the gauge so input channels are recognisable
+        // at a glance (the gauge centre still shows the live gain number).
+        if view.is_mic {
+            draw_mic_icon(&mut img, cx, 18, 4, 6, accent, false);
+        }
 
         // Channel label + accent underline.
         centered(
@@ -189,7 +199,11 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
 
     // Centre: mute icon, or the volume integer.
     if view.muted {
-        draw_mute_icon(img, cx, GAUGE_CY);
+        if view.is_mic {
+            draw_mic_icon(img, cx, GAUGE_CY - 4, 6, 9, DIM, true);
+        } else {
+            draw_mute_icon(img, cx, GAUGE_CY);
+        }
     } else {
         let s = format!("{}", view.volume);
         let px = 46.0;
@@ -247,6 +261,52 @@ fn draw_mute_icon(img: &mut RgbImage, cx: i32, cy: i32) {
     );
     stroke(img, x0, y0, x1, y1, 4, BG);
     stroke(img, x0, y0, x1, y1, 2, MUTE);
+}
+
+/// A microphone glyph: a rounded-capsule body on a short stem + base. Sized by
+/// the body half-width/half-height (`bw`/`bh`); with `slash` it gets the same
+/// red strike-through as the mute-speaker icon (used for a muted mic).
+fn draw_mic_icon(
+    img: &mut RgbImage,
+    cx: i32,
+    cy: i32,
+    bw: i32,
+    bh: i32,
+    color: Rgb<u8>,
+    slash: bool,
+) {
+    // Capsule body: a rectangle capped with a circle top and bottom.
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - bw, cy - bh).of_size((bw * 2) as u32, (bh * 2) as u32),
+        color,
+    );
+    draw_filled_circle_mut(img, (cx, cy - bh), bw, color);
+    draw_filled_circle_mut(img, (cx, cy + bh), bw, color);
+    // Stem down to a short base, so it reads as a mic on a stand.
+    let stem_h = bh;
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - 1, cy + bh).of_size(2, stem_h as u32),
+        color,
+    );
+    let base_w = bw + 1;
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - base_w, cy + bh + stem_h).of_size((base_w * 2) as u32, 2),
+        color,
+    );
+    if slash {
+        let m = bw + 6;
+        let (x0, y0, x1, y1) = (
+            (cx - m) as f32,
+            (cy - m) as f32,
+            (cx + m) as f32,
+            (cy + m) as f32,
+        );
+        stroke(img, x0, y0, x1, y1, 4, BG);
+        stroke(img, x0, y0, x1, y1, 2, MUTE);
+    }
 }
 
 /// Draw a thick line by stepping filled circles along it.
@@ -347,6 +407,7 @@ mod tests {
             volume: 0,
             muted: false,
             apps: vec![],
+            is_mic: false,
         })
     }
 
@@ -357,24 +418,28 @@ mod tests {
                 volume: 100,
                 muted: false,
                 apps: vec!["Firefox".into(), "YouTube Music".into()],
+                is_mic: false,
             },
             ChannelView {
                 label: "CH 2".into(),
                 volume: 0,
                 muted: true,
                 apps: vec!["Discord".into()],
+                is_mic: false,
             },
             ChannelView {
                 label: "CH 3".into(),
                 volume: 75,
                 muted: false,
                 apps: vec!["Spotify".into()],
+                is_mic: false,
             },
             ChannelView {
-                label: "CH 4".into(),
-                volume: 0,
+                label: "Mic".into(),
+                volume: 60,
                 muted: false,
-                apps: vec![],
+                apps: vec!["Yeti Microphone".into()],
+                is_mic: true,
             },
         ]
     }
@@ -536,6 +601,48 @@ mod tests {
             found_dim,
             "expected DIM pixels at the '+N more' overflow line"
         );
+    }
+
+    #[test]
+    fn mic_channel_draws_accent_marker_above_the_gauge() {
+        // A mic channel gets a small accent-coloured mic glyph near the top of
+        // the tile (well above the gauge). Scan that band for an ACCENT pixel.
+        let mut views = empty_views();
+        views[0].is_mic = true;
+        let img = render_rgb(&views, None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let mut found = false;
+        'outer: for y in 8..=30 {
+            for dx in -8i32..=8 {
+                if *img.get_pixel((cx + dx).max(0) as u32, y as u32) == ACCENT[0] {
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found, "expected an ACCENT mic marker above the gauge");
+    }
+
+    #[test]
+    fn muted_mic_uses_mic_icon_not_speaker_and_no_number() {
+        // A muted mic draws the mic glyph (with a red slash) in the gauge centre,
+        // never the volume number. The red MUTE slash must be present.
+        let mut views = empty_views();
+        views[0].volume = 80;
+        views[0].muted = true;
+        views[0].is_mic = true;
+        let img = render_rgb(&views, None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let mut found_mute = false;
+        'outer: for y in (GAUGE_CY - 20)..=(GAUGE_CY + 20) {
+            for dx in -20i32..=20 {
+                if *img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32) == MUTE {
+                    found_mute = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_mute, "muted mic must show the red slash");
     }
 
     #[test]

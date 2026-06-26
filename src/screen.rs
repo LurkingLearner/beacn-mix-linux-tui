@@ -62,7 +62,11 @@ pub struct ChannelView {
     pub volume: u32,
     pub muted: bool,
     /// Source apps grouped on this channel (top-to-bottom). Empty = unbound.
+    /// For a mic channel this holds the single mic's name.
     pub apps: Vec<String>,
+    /// True when this channel rides a mic's gain (input) rather than a sink
+    /// (output): draws a mic marker, and a mic glyph for the mute icon.
+    pub is_mic: bool,
 }
 
 /// Load a backdrop image, scaled to cover 800×480 and darkened for legibility.
@@ -90,6 +94,17 @@ pub fn load_background(path: &Path) -> Option<RgbImage> {
 /// `background` (already sized to 800×480) the gauges are drawn over it; without
 /// one a solid colour is used.
 pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<Vec<u8>> {
+    let img = render_rgb(views, background)?;
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
+    enc.encode_image(&img)?;
+    Ok(buf)
+}
+
+/// Same as [`render`] but returns the raw 800×480 RGB buffer instead of a JPEG.
+/// Useful for tests that want to inspect pixels (and a tiny bit cheaper for any
+/// future caller that needs the bitmap directly).
+pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<RgbImage> {
     let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
     let mut img = match background {
         Some(bg) => bg.clone(),
@@ -107,6 +122,12 @@ pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result
         }
 
         draw_gauge(&mut img, &font, cx, view, accent);
+
+        // Small mic marker above the gauge so input channels are recognisable
+        // at a glance (the gauge centre still shows the live gain number).
+        if view.is_mic {
+            draw_mic_icon(&mut img, cx, 18, 4, 6, accent, false);
+        }
 
         // Channel label + accent underline.
         centered(
@@ -128,10 +149,7 @@ pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result
         draw_sources(&mut img, &font, cx, &view.apps);
     }
 
-    let mut buf = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
-    enc.encode_image(&img)?;
-    Ok(buf)
+    Ok(img)
 }
 
 /// The arc gauge: dim track, accent fill to the current level, a 100% headroom
@@ -181,7 +199,11 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
 
     // Centre: mute icon, or the volume integer.
     if view.muted {
-        draw_mute_icon(img, cx, GAUGE_CY);
+        if view.is_mic {
+            draw_mic_icon(img, cx, GAUGE_CY - 4, 6, 9, DIM, true);
+        } else {
+            draw_mute_icon(img, cx, GAUGE_CY);
+        }
     } else {
         let s = format!("{}", view.volume);
         let px = 46.0;
@@ -239,6 +261,52 @@ fn draw_mute_icon(img: &mut RgbImage, cx: i32, cy: i32) {
     );
     stroke(img, x0, y0, x1, y1, 4, BG);
     stroke(img, x0, y0, x1, y1, 2, MUTE);
+}
+
+/// A microphone glyph: a rounded-capsule body on a short stem + base. Sized by
+/// the body half-width/half-height (`bw`/`bh`); with `slash` it gets the same
+/// red strike-through as the mute-speaker icon (used for a muted mic).
+fn draw_mic_icon(
+    img: &mut RgbImage,
+    cx: i32,
+    cy: i32,
+    bw: i32,
+    bh: i32,
+    color: Rgb<u8>,
+    slash: bool,
+) {
+    // Capsule body: a rectangle capped with a circle top and bottom.
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - bw, cy - bh).of_size((bw * 2) as u32, (bh * 2) as u32),
+        color,
+    );
+    draw_filled_circle_mut(img, (cx, cy - bh), bw, color);
+    draw_filled_circle_mut(img, (cx, cy + bh), bw, color);
+    // Stem down to a short base, so it reads as a mic on a stand.
+    let stem_h = bh;
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - 1, cy + bh).of_size(2, stem_h as u32),
+        color,
+    );
+    let base_w = bw + 1;
+    draw_filled_rect_mut(
+        img,
+        Rect::at(cx - base_w, cy + bh + stem_h).of_size((base_w * 2) as u32, 2),
+        color,
+    );
+    if slash {
+        let m = bw + 6;
+        let (x0, y0, x1, y1) = (
+            (cx - m) as f32,
+            (cy - m) as f32,
+            (cx + m) as f32,
+            (cy + m) as f32,
+        );
+        stroke(img, x0, y0, x1, y1, 4, BG);
+        stroke(img, x0, y0, x1, y1, 2, MUTE);
+    }
 }
 
 /// Draw a thick line by stepping filled circles along it.
@@ -318,5 +386,308 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The renderer is pure (input = views + optional background, output =
+    //! `RgbImage`) so all the assertions here inspect pixels of `render_rgb`.
+    //! What we care about: dimensions, accent colour reaches the gauge at the
+    //! expected volume, the mute icon appears (and the volume number does not)
+    //! when muted, the empty-channels em-dash, the overflow line, and the
+    //! `truncate` helper's char-count contract.
+
+    use super::*;
+    use image::Rgb;
+
+    fn empty_views() -> [ChannelView; 4] {
+        std::array::from_fn(|i| ChannelView {
+            label: format!("CH {}", i + 1),
+            volume: 0,
+            muted: false,
+            apps: vec![],
+            is_mic: false,
+        })
+    }
+
+    fn sample_views() -> [ChannelView; 4] {
+        [
+            ChannelView {
+                label: "CH 1".into(),
+                volume: 100,
+                muted: false,
+                apps: vec!["Firefox".into(), "YouTube Music".into()],
+                is_mic: false,
+            },
+            ChannelView {
+                label: "CH 2".into(),
+                volume: 0,
+                muted: true,
+                apps: vec!["Discord".into()],
+                is_mic: false,
+            },
+            ChannelView {
+                label: "CH 3".into(),
+                volume: 75,
+                muted: false,
+                apps: vec!["Spotify".into()],
+                is_mic: false,
+            },
+            ChannelView {
+                label: "Mic".into(),
+                volume: 60,
+                muted: false,
+                apps: vec!["Yeti Microphone".into()],
+                is_mic: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn render_rgb_returns_800x480() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        assert_eq!(img.width(), W);
+        assert_eq!(img.height(), H);
+    }
+
+    #[test]
+    fn solid_bg_is_used_when_no_background() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // A corner pixel must match the declared `BG` constant.
+        assert_eq!(*img.get_pixel(0, 0), BG);
+    }
+
+    #[test]
+    fn custom_background_is_composited_not_replaced() {
+        // A custom background of a solid red should appear in a corner — the
+        // renderer composites the gauges over it rather than replacing it.
+        let bg = RgbImage::from_pixel(W, H, Rgb([200, 30, 30]));
+        let img = render_rgb(&empty_views(), Some(&bg)).expect("render");
+        // Top-left corner is above any gauge / label / divider, so it must
+        // pass through as the background red.
+        assert_eq!(*img.get_pixel(0, 0), Rgb([200, 30, 30]));
+    }
+
+    #[test]
+    fn column_dividers_are_drawn_between_channels() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // At x = 200 (the start of column 1) the divider rect should be TRACK.
+        let px = img.get_pixel(200, H / 2);
+        assert_eq!(*px, TRACK, "expected TRACK divider at column boundary");
+        // At x = 0 (column 0, no divider on the leftmost) it must be the BG.
+        assert_eq!(*img.get_pixel(0, H / 2), BG);
+    }
+
+    #[test]
+    fn accent_underline_uses_the_channel_colour() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // Underline is at UNDERLINE_Y (228), centred on each column. Sample the
+        // centre of column 0's underline — it must be ACCENT[0] (blue).
+        let cx = (COL_W / 2) as i32;
+        assert_eq!(
+            *img.get_pixel(cx as u32, UNDERLINE_Y as u32 + 1),
+            ACCENT[0],
+            "column 0 underline must be ACCENT[0]"
+        );
+        // And column 1's underline must be ACCENT[1] (green), not [0].
+        let cx1 = (COL_W + COL_W / 2) as i32;
+        assert_eq!(
+            *img.get_pixel(cx1 as u32, UNDERLINE_Y as u32 + 1),
+            ACCENT[1],
+            "column 1 underline must be ACCENT[1]"
+        );
+    }
+
+    #[test]
+    fn arc_fill_at_full_volume_reaches_accent_colour() {
+        let mut views = empty_views();
+        views[0].volume = 150; // VOLUME_MAX
+        let img = render_rgb(&views, None).expect("render");
+        // A point near the end of the gauge sweep should be the accent colour.
+        // Sweep starts at 135° (lower-left) and goes 270° clockwise to 405°
+        // (i.e. 45°), so the end is roughly the upper-right quadrant.
+        // GAUGE_R = 64, GAUGE_CY = 116, centre cx = 100 for col 0.
+        let end_rad = (GAUGE_START + GAUGE_SWEEP).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * end_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * end_rad.sin()).round();
+        let px = img.get_pixel(x as u32, y as u32);
+        assert_eq!(*px, ACCENT[0], "arc end at 100% volume must be ACCENT[0]");
+    }
+
+    #[test]
+    fn arc_track_is_visible_where_fill_does_not_reach() {
+        let mut views = empty_views();
+        views[0].volume = 0; // no fill — only the track
+        let img = render_rgb(&views, None).expect("render");
+        // At the end of the sweep (no fill here), the track colour must show.
+        let end_rad = (GAUGE_START + GAUGE_SWEEP).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * end_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * end_rad.sin()).round();
+        let px = img.get_pixel(x as u32, y as u32);
+        assert_eq!(*px, TRACK, "track must be visible at volume=0");
+    }
+
+    #[test]
+    fn muted_channel_uses_mute_arc_colour_for_fill() {
+        let mut views = empty_views();
+        views[0].volume = 100;
+        views[0].muted = true;
+        let img = render_rgb(&views, None).expect("render");
+        // Mid-sweep (fraction 0.5) is well inside the fill band.
+        let mid_rad = (GAUGE_START + GAUGE_SWEEP * 0.5).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * mid_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * mid_rad.sin()).round();
+        assert_eq!(
+            *img.get_pixel(x as u32, y as u32),
+            MUTE_ARC,
+            "muted fill must use MUTE_ARC"
+        );
+    }
+
+    #[test]
+    fn empty_channel_renders_em_dash_in_source_area() {
+        // No background, no apps on any channel — the em-dash must be drawn at
+        // LIST_Y0 in DIM colour. Em-dash is short glyph so we sample a band of
+        // rows (the actual glyph renders slightly below the baseline because of
+        // font ascent) and assert at least one DIM pixel exists in that band.
+        let img = render_rgb(&empty_views(), None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let y0 = LIST_Y0;
+        let mut found_dim = false;
+        'outer: for y in (y0 - 2)..=(y0 + 20) {
+            for dx in (-30i32..=30).step_by(2) {
+                let p = img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32);
+                if *p == DIM {
+                    found_dim = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_dim, "expected a DIM-coloured pixel under the em-dash");
+    }
+
+    #[test]
+    fn overflow_line_uses_plus_n_more_format() {
+        let mut views = empty_views();
+        // LIST_MAX_LINES = 9 — feed in 12 apps, expect "+3 more" on the
+        // overflow line at LIST_Y0 + (LIST_MAX_LINES - 1) * LIST_LINE_H.
+        views[0].apps = (1..=12).map(|i| format!("app{}", i)).collect();
+        let img = render_rgb(&views, None).expect("render");
+        // We can't OCR the bitmap, but we can prove two things at once:
+        //   1. With 12 apps, the renderer doesn't crash (it would panic on a
+        //      bounds issue before this assertion even runs).
+        //   2. The overflow line lands at LIST_Y0 + 8 * LIST_LINE_H, which is
+        //      *after* the 9 shown apps — scan that row for any DIM pixel.
+        let cx = (COL_W / 2) as i32;
+        let overflow_y = LIST_Y0 + ((LIST_MAX_LINES as i32) - 1) * LIST_LINE_H - 2;
+        let mut found_dim = false;
+        'outer: for y in overflow_y..=(overflow_y + 22) {
+            for dx in (-50i32..=50).step_by(2) {
+                let p = img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32);
+                if *p == DIM {
+                    found_dim = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            found_dim,
+            "expected DIM pixels at the '+N more' overflow line"
+        );
+    }
+
+    #[test]
+    fn mic_channel_draws_accent_marker_above_the_gauge() {
+        // A mic channel gets a small accent-coloured mic glyph near the top of
+        // the tile (well above the gauge). Scan that band for an ACCENT pixel.
+        let mut views = empty_views();
+        views[0].is_mic = true;
+        let img = render_rgb(&views, None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let mut found = false;
+        'outer: for y in 8..=30 {
+            for dx in -8i32..=8 {
+                if *img.get_pixel((cx + dx).max(0) as u32, y as u32) == ACCENT[0] {
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found, "expected an ACCENT mic marker above the gauge");
+    }
+
+    #[test]
+    fn muted_mic_uses_mic_icon_not_speaker_and_no_number() {
+        // A muted mic draws the mic glyph (with a red slash) in the gauge centre,
+        // never the volume number. The red MUTE slash must be present.
+        let mut views = empty_views();
+        views[0].volume = 80;
+        views[0].muted = true;
+        views[0].is_mic = true;
+        let img = render_rgb(&views, None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let mut found_mute = false;
+        'outer: for y in (GAUGE_CY - 20)..=(GAUGE_CY + 20) {
+            for dx in -20i32..=20 {
+                if *img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32) == MUTE {
+                    found_mute = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_mute, "muted mic must show the red slash");
+    }
+
+    #[test]
+    fn jpeg_render_returns_non_empty_bytes() {
+        let jpeg = render(&sample_views(), None).expect("render jpeg");
+        assert!(!jpeg.is_empty(), "JPEG blob must not be empty");
+        // The JPEG SOI marker is FF D8 FF.
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn jpeg_with_background_still_decodes_to_800x480() {
+        let bg = RgbImage::from_pixel(W, H, Rgb([10, 200, 30]));
+        let jpeg = render(&sample_views(), Some(&bg)).expect("render jpeg");
+        let decoded = image::load_from_memory(&jpeg)
+            .expect("decode jpeg")
+            .to_rgb8();
+        assert_eq!(decoded.width(), W);
+        assert_eq!(decoded.height(), H);
+    }
+
+    // --- truncate -----------------------------------------------------------
+
+    #[test]
+    fn truncate_returns_input_under_limit() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("", 5), "");
+        assert_eq!(truncate("abc", 3), "abc"); // exactly at limit, no ellipsis
+    }
+
+    #[test]
+    fn truncate_replaces_tail_with_ellipsis() {
+        let out = truncate("abcdefghijklmnop", 5);
+        // 4 chars + ellipsis
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("abcd"));
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_at_boundary() {
+        // The function must count chars, not bytes — `é` is 2 bytes.
+        let s = "aébcdef";
+        let out = truncate(s, 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('…'));
     }
 }

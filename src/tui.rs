@@ -10,7 +10,7 @@
 
 use crate::mix::Channel;
 use crate::pw;
-use crate::state::{Bindings, DisplayConfig, Levels};
+use crate::state::{Bindings, DisplayConfig, Levels, OutputConfig};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -35,11 +35,13 @@ const ACCENT: [Color; 4] = [
     Color::Rgb(190, 130, 240), // violet
 ];
 
-/// Settings rows: dim-after, full brightness, dim brightness, 4 channel names,
-/// then the "reload background" action button.
-const SETTINGS_FIELDS: usize = 8;
-/// Index of the first channel-name row (rows below this are numeric).
-const NAME_FIELD_BASE: usize = 3;
+/// Settings rows: dim-after, full brightness, dim brightness, output device,
+/// 4 channel names, then the "reload background" action button.
+const SETTINGS_FIELDS: usize = 9;
+/// Index of the output-device row (cycled with ←/→).
+const OUTPUT_FIELD: usize = 3;
+/// Index of the first channel-name row.
+const NAME_FIELD_BASE: usize = 4;
 /// Index of the "reload background" action row (just past the 4 name rows).
 const REFRESH_FIELD: usize = NAME_FIELD_BASE + 4;
 /// Max length of a custom channel name.
@@ -51,8 +53,9 @@ enum Page {
     Settings,
 }
 
-/// One manageable entry: either a live playback stream or an app that's bound to
-/// a channel but isn't currently playing.
+/// One manageable entry: a live playback stream, an app that's bound to a
+/// channel but isn't currently playing, or a capture device (mic) that can ride
+/// a channel's gain.
 #[derive(Clone)]
 enum Row {
     Live {
@@ -65,18 +68,28 @@ enum Row {
         app: String,
         channel: Channel,
     },
+    Mic {
+        /// Source node name (the pactl handle).
+        name: String,
+        /// Friendly description for display.
+        label: String,
+        /// Channel this mic is currently bound to, if any.
+        channel: Option<Channel>,
+    },
 }
 
 impl Row {
+    /// A short human label for status messages.
     fn app(&self) -> &str {
         match self {
             Row::Live { app, .. } | Row::Idle { app, .. } => app,
+            Row::Mic { label, .. } => label,
         }
     }
 
     fn channel(&self) -> Option<Channel> {
         match self {
-            Row::Live { channel, .. } => *channel,
+            Row::Live { channel, .. } | Row::Mic { channel, .. } => *channel,
             Row::Idle { channel, .. } => Some(*channel),
         }
     }
@@ -84,7 +97,7 @@ impl Row {
     fn stream_index(&self) -> Option<u32> {
         match self {
             Row::Live { index, .. } => Some(*index),
-            Row::Idle { .. } => None,
+            Row::Idle { .. } | Row::Mic { .. } => None,
         }
     }
 
@@ -97,6 +110,7 @@ impl Row {
         match self {
             Row::Live { label, .. } => format!("[{ch}] {label}"),
             Row::Idle { app, .. } => format!("[{ch}] {app} (idle)"),
+            Row::Mic { label, .. } => format!("[{ch}] {label} (mic)"),
         }
     }
 }
@@ -133,26 +147,60 @@ fn snapshot() -> Snapshot {
         }
     }
 
+    // Capture devices (mics): one row each, showing which channel (if any) they
+    // ride. Selecting one + 1-4 binds it so that channel's encoder rides its gain.
+    let mics = pw::list_sources().unwrap_or_default();
+    let present: HashSet<&str> = mics.iter().map(|m| m.name.as_str()).collect();
+    for m in &mics {
+        rows.push(Row::Mic {
+            name: m.name.clone(),
+            label: m.label().to_string(),
+            channel: bindings.channel_for_mic(&m.name),
+        });
+    }
+    // Bound mics whose device isn't currently present (e.g. a wireless mic that's
+    // detached) — still show them so they can be unbound.
+    for (name, &ch) in &bindings.mic_by_source {
+        if !present.contains(name.as_str()) {
+            rows.push(Row::Mic {
+                name: name.clone(),
+                label: name.clone(),
+                channel: Some(Channel(ch)),
+            });
+        }
+    }
+
     Snapshot { rows, levels }
 }
 
-/// Bind a row to a channel: move its live stream (if any) and persist the binding.
+/// Bind a row to a channel: move its live stream (if any) and persist the
+/// binding. For a mic there's no graph move — we just persist the binding and the
+/// daemon starts riding that mic's gain on the channel within ~1s.
 fn assign(row: &Row, ch: Channel) -> Result<()> {
+    let mut bindings = Bindings::load().unwrap_or_default();
+    if let Row::Mic { name, .. } = row {
+        bindings.set_mic(ch, name);
+        return bindings.save();
+    }
     if let Some(idx) = row.stream_index() {
         pw::move_stream(idx, ch)?;
     }
-    let mut bindings = Bindings::load().unwrap_or_default();
     bindings.set(row.app(), ch);
     bindings.save()
 }
 
-/// Drop a row's binding and move its live stream back to the default output.
+/// Drop a row's binding. For an app, move its live stream back to the default
+/// output; for a mic, just clear the binding (the daemon stops riding its gain).
 fn unassign(row: &Row) -> Result<()> {
+    let mut bindings = Bindings::load().unwrap_or_default();
+    if let Row::Mic { name, .. } = row {
+        bindings.remove_mic(name);
+        return bindings.save();
+    }
     if let Some(idx) = row.stream_index() {
         let default = pw::default_sink()?;
         pw::move_to_sink(idx, &default)?;
     }
-    let mut bindings = Bindings::load().unwrap_or_default();
     bindings.remove(row.app());
     bindings.save()
 }
@@ -176,6 +224,10 @@ struct App {
     routing: ListState,
     settings: ListState,
     display: DisplayConfig,
+    /// Chosen output device the channels feed (None = system default).
+    output: OutputConfig,
+    /// Available output devices, for the output-device cycle row.
+    outputs: Vec<pw::Output>,
     /// True while typing into the selected channel-name field.
     editing: bool,
     status: String,
@@ -215,6 +267,8 @@ pub fn run() -> Result<()> {
         routing,
         settings,
         display: DisplayConfig::load().unwrap_or_default(),
+        output: OutputConfig::load().unwrap_or_default(),
+        outputs: pw::list_outputs().unwrap_or_default(),
         editing: false,
         status: String::new(),
     };
@@ -327,8 +381,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
     let is_name = (NAME_FIELD_BASE..REFRESH_FIELD).contains(&field);
     let is_button = field == REFRESH_FIELD;
-    // Numeric (adjustable) rows are everything that isn't a name or the button.
-    let is_numeric = !is_name && !is_button;
+    let is_output = field == OUTPUT_FIELD;
+    // Numeric (adjustable) rows are everything that isn't a name, the output
+    // cycle, or the button.
+    let is_numeric = !is_name && !is_button && !is_output;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -348,6 +404,9 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         {
             save_adjust(app, field, 1)
         }
+        // Output device cycles through the available sinks with ←/→.
+        KeyCode::Left | KeyCode::Char('h') if is_output => cycle_output(app, -1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter if is_output => cycle_output(app, 1),
         KeyCode::Enter if is_name => {
             app.editing = true;
             app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
@@ -411,6 +470,35 @@ fn save_adjust(app: &mut App, field: usize, dir: i64) {
     };
 }
 
+/// Step the chosen output device by `dir` (wrapping) and persist it; the daemon
+/// repoints all four channel loopbacks onto it within ~1s.
+fn cycle_output(app: &mut App, dir: i64) {
+    if app.outputs.is_empty() {
+        app.status = "No output devices found.".to_string();
+        return;
+    }
+    let n = app.outputs.len() as i64;
+    let cur = app
+        .output
+        .sink
+        .as_deref()
+        .and_then(|s| app.outputs.iter().position(|o| o.name == s));
+    let next = match cur {
+        Some(i) => (i as i64 + dir).rem_euclid(n) as usize,
+        // Nothing chosen yet: ← lands on the last device, → on the first.
+        None if dir < 0 => (n - 1) as usize,
+        None => 0,
+    };
+    app.output.sink = Some(app.outputs[next].name.clone());
+    app.status = match app.output.save() {
+        Ok(()) => format!(
+            "Output → {} (daemon switches within ~1s).",
+            app.outputs[next].label()
+        ),
+        Err(e) => format!("Save failed: {e}"),
+    };
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(f.area());
 
@@ -464,6 +552,10 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
                         format!("{app} (idle)"),
                         Style::new().fg(Color::DarkGray),
                     )),
+                    Row::Mic { label, .. } => lines.push(Line::styled(
+                        format!("mic: {label}"),
+                        Style::new().fg(ACCENT[i]),
+                    )),
                 }
             }
         }
@@ -485,7 +577,7 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|r| ListItem::new(r.display()))
         .collect();
     let list = List::new(items)
-        .block(Block::bordered().title(" Streams — select, then 1-4 to assign "))
+        .block(Block::bordered().title(" Streams & mics — select, then 1-4 to assign "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[1], &mut app.routing);
@@ -511,10 +603,21 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
 
     let d = &app.display;
     let sel = app.settings.selected().unwrap_or(0);
+    // Friendly label for the currently-chosen output device.
+    let output_label = match &app.output.sink {
+        Some(name) => app
+            .outputs
+            .iter()
+            .find(|o| &o.name == name)
+            .map(|o| o.label().to_string())
+            .unwrap_or_else(|| format!("{name} (not present)")),
+        None => "(system default)".to_string(),
+    };
     let mut items: Vec<ListItem> = vec![
         field_item("Dim after", format!("{} min", d.dim_after_secs / 60)),
         field_item("Full brightness", format!("{}%", d.full_brightness)),
         field_item("Dim brightness", format!("{}%", d.dim_brightness)),
+        field_item("Output device", format!("◂ {output_label} ▸")),
     ];
     for i in 0..4 {
         let name = &d.channel_names[i];
@@ -548,6 +651,8 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         app.status.clone()
     } else if sel == REFRESH_FIELD {
         "↑/↓ select · Enter reload background · Tab routing · q quit".to_string()
+    } else if sel == OUTPUT_FIELD {
+        "↑/↓ select · ←/→ change output device · Tab routing · q quit".to_string()
     } else if sel >= NAME_FIELD_BASE {
         "↑/↓ select · Enter rename · Tab routing · q quit".to_string()
     } else {

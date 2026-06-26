@@ -1,0 +1,20 @@
+[Unit]
+Description=Beacn Mix PipeWire channel mixer
+Documentation=https://github.com/beacn-on-linux/beacn-utility
+# Order after the sound stack is up. These are user units; pactl talks to the
+# Pulse-compat shim, which pulls in pipewire itself.
+After=pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/beacn-mix run
+# The device may not be plugged in (or its udev ACL not yet applied) the instant
+# we start; keep retrying instead of giving up.
+Restart=on-failure
+RestartSec=3
+# Quiet down the journal a touch; bump to debug if you're chasing something.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

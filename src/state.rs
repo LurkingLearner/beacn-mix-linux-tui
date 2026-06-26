@@ -72,6 +72,20 @@ impl Bindings {
     pub fn channel_for_app(&self, app: &str) -> Option<Channel> {
         self.by_app.get(app).copied().map(Channel)
     }
+
+    /// Drop an app's binding (so it stops auto-routing).
+    pub fn remove(&mut self, app: &str) {
+        self.by_app.remove(app);
+    }
+
+    /// All apps currently bound to a channel, in stable (alphabetical) order.
+    pub fn apps_for_channel(&self, ch: Channel) -> Vec<String> {
+        self.by_app
+            .iter()
+            .filter(|(_, &c)| c == ch.0)
+            .map(|(app, _)| app.clone())
+            .collect()
+    }
 }
 
 /// Per-channel volume (%) and mute state, persisted across restarts.

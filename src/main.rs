@@ -9,6 +9,7 @@ mod mix;
 mod pw;
 mod screen;
 mod state;
+mod tui;
 
 use anyhow::{Context, Result};
 use beacn_lib::controller::{ButtonState, Interactions};
@@ -49,6 +50,8 @@ enum Command {
     Teardown,
     /// Interactively bind a playing app to one of the four channels.
     Assign,
+    /// Terminal UI to view and manage channel routing (runs alongside the daemon).
+    Tui,
     /// Print raw hardware events (dial/button) — a hardware sanity check.
     Events,
     /// Render a sample panel image to a file (no hardware needed).
@@ -66,6 +69,7 @@ fn main() -> Result<()> {
         Command::Setup => cmd_setup().map(|n| log::info!("Channels ready ({n} new modules).")),
         Command::Teardown => cmd_teardown(),
         Command::Assign => cmd_assign(),
+        Command::Tui => tui::run(),
         Command::Events => cmd_events(),
         Command::Preview { path } => cmd_preview(&path),
     }
@@ -77,21 +81,25 @@ fn cmd_preview(path: &str) -> Result<()> {
             name: "Firefox".into(),
             volume: 75,
             muted: false,
+            extra: 1,
         },
         ChannelView {
             name: "Discord".into(),
             volume: 110,
             muted: false,
+            extra: 0,
         },
         ChannelView {
             name: "Spotify".into(),
             volume: 45,
             muted: true,
+            extra: 0,
         },
         ChannelView {
             name: "—".into(),
             volume: 75,
             muted: false,
+            extra: 0,
         },
     ];
     let jpeg = screen::render(&views)?;
@@ -146,7 +154,7 @@ fn cmd_events() -> Result<()> {
 
 fn cmd_assign() -> Result<()> {
     cmd_setup()?;
-    let streams = pw::list_streams()?;
+    let streams = pw::app_streams()?;
     if streams.is_empty() {
         println!("No playing audio streams found. Start playback in an app and try again.");
         return Ok(());
@@ -194,7 +202,8 @@ fn cmd_run() -> Result<()> {
     for _ in mix.events.try_iter() {}
 
     mix.init_display();
-    refresh_screen(&mix, &volumes, &mutes);
+    let mut labels = channel_labels();
+    refresh_screen(&mix, &labels, &volumes, &mutes);
 
     log::info!(
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
@@ -256,7 +265,7 @@ fn cmd_run() -> Result<()> {
             },
             recv(ui) -> _ => {
                 if dirty {
-                    refresh_screen(&mix, &volumes, &mutes);
+                    refresh_screen(&mix, &labels, &volumes, &mutes);
                     dirty = false;
                 }
                 if levels_dirty {
@@ -264,6 +273,15 @@ fn cmd_run() -> Result<()> {
                     levels_dirty = false;
                 }
                 ticks += 1;
+                // Re-poll routing roughly once a second so panel labels track
+                // assign/unassign done in the TUI without needing a knob turn.
+                if ticks.is_multiple_of(7) {
+                    let next = channel_labels();
+                    if next != labels {
+                        labels = next;
+                        dirty = true;
+                    }
+                }
                 if ticks.is_multiple_of(200) {
                     mix.keep_awake();
                 }
@@ -276,14 +294,13 @@ fn cmd_run() -> Result<()> {
     Ok(())
 }
 
-/// Build the four channel tiles from current volumes/mutes plus the bound app
-/// names (read fresh from disk so `assign` shows up without a restart).
-fn refresh_screen(mix: &Mix, volumes: &[u32; 4], mutes: &[bool; 4]) {
-    let names = channel_names();
+/// Build the four channel tiles from precomputed labels + current volumes/mutes.
+fn refresh_screen(mix: &Mix, labels: &[(String, usize); 4], volumes: &[u32; 4], mutes: &[bool; 4]) {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
-        name: names[i].clone(),
+        name: labels[i].0.clone(),
         volume: volumes[i],
         muted: mutes[i],
+        extra: labels[i].1,
     });
     match screen::render(&views) {
         Ok(jpeg) => {
@@ -295,17 +312,46 @@ fn refresh_screen(mix: &Mix, volumes: &[u32; 4], mutes: &[bool; 4]) {
     }
 }
 
-/// channel index -> bound app name (or "—" when unbound).
-fn channel_names() -> [String; 4] {
-    let mut names: [String; 4] = std::array::from_fn(|_| "—".to_string());
-    if let Ok(bindings) = Bindings::load() {
-        for (app, &ch) in &bindings.by_app {
-            if ch < 4 && names[ch] == "—" {
-                names[ch] = app.clone();
-            }
+/// Per-channel panel label: (first app's name, count of *additional* apps on the
+/// channel). Derived from **live routing** — what's actually playing on each
+/// channel's sink — so two instances of the same app (e.g. two Firefox windows)
+/// each show on their own channel instead of colliding on one binding key. Falls
+/// back to a bound-but-idle app name when nothing is playing there.
+fn channel_labels() -> [(String, usize); 4] {
+    let streams = pw::app_streams().unwrap_or_default();
+    let bindings = Bindings::load().unwrap_or_default();
+    std::array::from_fn(|i| {
+        let ch = Channel(i);
+        let live: Vec<&str> = streams
+            .iter()
+            .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
+            .map(panel_label)
+            .collect();
+        if let Some((first, rest)) = live.split_first() {
+            return (first.to_string(), rest.len());
         }
+        match bindings.apps_for_channel(ch).split_first() {
+            Some((first, rest)) => (first.clone(), rest.len()),
+            None => ("—".to_string(), 0),
+        }
+    })
+}
+
+/// Longest `media.name` we'll show in place of the app name on the panel. Above
+/// this it's a volatile tab title (e.g. a full video name), so we keep the app
+/// name instead of a truncated fragment.
+const PANEL_LABEL_MAX: usize = 13;
+
+/// What to print for a stream on the panel: a short, descriptive media name when
+/// the app gives one (e.g. "YouTube Music"), otherwise the app name. This lets
+/// two instances of the same app stay distinguishable when they happen to expose
+/// a clean media name, without churning on long page titles.
+fn panel_label(s: &pw::Stream) -> &str {
+    if !s.media.is_empty() && s.media != s.app && s.media.chars().count() <= PANEL_LABEL_MAX {
+        &s.media
+    } else {
+        &s.app
     }
-    names
 }
 
 /// Periodically move newly-appeared app streams onto their bound channel.
@@ -313,13 +359,21 @@ fn channel_names() -> [String; 4] {
 fn auto_route_loop() {
     let mut routed: HashSet<u32> = HashSet::new();
     loop {
-        if let Ok(streams) = pw::list_streams() {
+        if let Ok(streams) = pw::app_streams() {
             let live: HashSet<u32> = streams.iter().map(|s| s.index).collect();
             routed.retain(|i| live.contains(i));
 
             if let Ok(bindings) = Bindings::load() {
                 for s in &streams {
                     if routed.contains(&s.index) {
+                        continue;
+                    }
+                    // Leave streams already sitting on a channel alone — they may
+                    // have been placed there deliberately (e.g. a second instance
+                    // of an app moved to a different channel via the TUI). Only
+                    // auto-route streams that aren't on a channel yet.
+                    if pw::channel_of_sink(&s.sink).is_some() {
+                        routed.insert(s.index);
                         continue;
                     }
                     if let Some(ch) = bindings.channel_for_app(&s.app) {

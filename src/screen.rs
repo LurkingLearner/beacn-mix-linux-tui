@@ -34,6 +34,8 @@ pub struct ChannelView {
     pub name: String,
     pub volume: u32,
     pub muted: bool,
+    /// How many *additional* apps share this channel beyond `name` (0 = just one).
+    pub extra: usize,
 }
 
 /// Render the four tiles into a JPEG suitable for `set_image(0, 0, ..)`.
@@ -65,6 +67,19 @@ pub fn render(views: &[ChannelView; 4]) -> Result<Vec<u8>> {
         // App name (truncated to fit the column).
         let name = truncate(&view.name, 13);
         centered(&mut img, &font, cx, 58, 26.0, FG, &name);
+
+        // When several apps share this channel, note how many more there are.
+        if view.extra > 0 {
+            centered(
+                &mut img,
+                &font,
+                cx,
+                90,
+                18.0,
+                accent,
+                &format!("+{} more", view.extra),
+            );
+        }
 
         // Vertical level bar.
         let bar_w = 56;

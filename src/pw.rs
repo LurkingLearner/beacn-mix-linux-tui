@@ -7,7 +7,9 @@
 //! could swap this for the native `pipewire` crate.
 
 use crate::mix::Channel;
+use crate::state::Modules;
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::process::Command;
 
 /// PipeWire node name for a channel's null sink.
@@ -40,6 +42,18 @@ fn existing_sinks() -> Result<Vec<String>> {
     Ok(pactl(&["list", "short", "sinks"])?
         .lines()
         .filter_map(|l| l.split('\t').nth(1).map(str::to_owned))
+        .collect())
+}
+
+/// Map of sink numeric index -> sink name (`pactl list sink-inputs` reports the
+/// sink as an index, but we want the name to recognise our `BeacnChN` sinks).
+fn sink_name_by_index() -> Result<HashMap<String, String>> {
+    Ok(pactl(&["list", "short", "sinks"])?
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            Some((it.next()?.to_owned(), it.next()?.to_owned()))
+        })
         .collect())
 }
 
@@ -117,6 +131,19 @@ pub fn move_stream(stream_index: u32, ch: Channel) -> Result<()> {
     Ok(())
 }
 
+/// Move a playback stream onto an arbitrary sink by name (used to unassign a
+/// stream back to the real default output).
+pub fn move_to_sink(stream_index: u32, sink: &str) -> Result<()> {
+    pactl(&["move-sink-input", &stream_index.to_string(), sink])?;
+    Ok(())
+}
+
+/// Which channel (if any) a sink name refers to, e.g. `BeacnCh2` -> Channel(1).
+pub fn channel_of_sink(sink: &str) -> Option<Channel> {
+    let n: usize = sink.strip_prefix("BeacnCh")?.parse().ok()?;
+    (1..=4).contains(&n).then(|| Channel(n - 1))
+}
+
 /// Unload a previously-loaded module (used by teardown).
 pub fn unload_module(id: u32) -> Result<()> {
     pactl(&["unload-module", &id.to_string()])?;
@@ -131,6 +158,9 @@ pub struct Stream {
     pub media: String,
     /// The sink id this stream is currently routed to.
     pub sink: String,
+    /// The pactl module that owns this sink-input, if any. Our own loopbacks
+    /// are owned by a `module-loopback` we loaded, which lets us filter them.
+    pub owner_module: Option<u32>,
 }
 
 impl Stream {
@@ -165,11 +195,14 @@ pub fn list_streams() -> Result<Vec<Stream>> {
                     app: String::new(),
                     media: String::new(),
                     sink: String::new(),
+                    owner_module: None,
                 });
             }
         } else if let Some(s) = cur.as_mut() {
             if let Some(v) = trimmed.strip_prefix("Sink: ") {
                 s.sink = v.trim().to_owned();
+            } else if let Some(v) = trimmed.strip_prefix("Owner Module: ") {
+                s.owner_module = v.trim().parse().ok();
             } else if let Some(v) = prop(trimmed, "application.name") {
                 s.app = v;
             } else if let Some(v) = prop(trimmed, "media.name") {
@@ -179,7 +212,14 @@ pub fn list_streams() -> Result<Vec<Stream>> {
     }
     push(&mut streams, &mut cur);
 
+    // The `Sink:` line is a numeric index; resolve it to the sink name so
+    // callers can recognise our `BeacnChN` channels. Leave it as-is if a name
+    // already came through (older/newer pactl variants differ).
+    let by_index = sink_name_by_index().unwrap_or_default();
     for s in &mut streams {
+        if let Some(name) = by_index.get(&s.sink) {
+            s.sink = name.clone();
+        }
         if s.app.is_empty() {
             s.app = if s.media.is_empty() {
                 format!("stream {}", s.index)
@@ -189,6 +229,20 @@ pub fn list_streams() -> Result<Vec<Stream>> {
         }
     }
     Ok(streams)
+}
+
+/// Live application streams, with our own channel loopbacks filtered out.
+/// Primary filter is the owner module (we persist the loopback module ids);
+/// the name-prefix check is a fallback for a stale `modules.json`.
+pub fn app_streams() -> Result<Vec<Stream>> {
+    let ours: std::collections::HashSet<u32> = Modules::load()
+        .map(|m| m.ids.into_iter().collect())
+        .unwrap_or_default();
+    Ok(list_streams()?
+        .into_iter()
+        .filter(|s| !s.owner_module.is_some_and(|id| ours.contains(&id)))
+        .filter(|s| !s.app.starts_with("loopback-") && !s.media.starts_with("loopback-"))
+        .collect())
 }
 
 /// Parse a `key = "value"` property line, returning the unquoted value.

@@ -1,0 +1,21 @@
+[package]
+name = "beacn-mix-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Use a Beacn Mix as a PipeWire channel mixer: bind app audio to the four channels and ride levels with the hardware encoders."
+
+[dependencies]
+beacn-lib = { git = "https://github.com/beacn-on-linux/beacn-lib.git", tag = "v0.1.9" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+env_logger = "0.11"
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+imageproc = "0.25"
+ab_glyph = "0.2"
+
+[[bin]]
+name = "beacn-mix"
+path = "src/main.rs"

@@ -1,0 +1,7 @@
+# Beacn devices — grant access to the logged-in user (no root needed).
+# Install to /etc/udev/rules.d/ then: udevadm control --reload-rules && udevadm trigger
+SUBSYSTEM=="usb", ATTRS{idVendor}=="33ae", ATTRS{idProduct}=="0001", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="33ae", ATTRS{idProduct}=="8001", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="33ae", ATTRS{idProduct}=="0003", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="33ae", ATTRS{idProduct}=="0004", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="33ae", ATTRS{idProduct}=="0007", TAG+="uaccess"

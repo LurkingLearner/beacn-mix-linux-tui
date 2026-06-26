@@ -23,6 +23,35 @@ pub struct Mix {
 impl Mix {
     /// Find the first attached Beacn Mix and open it for interaction.
     pub fn open() -> Result<Self> {
+        Self::open_with_retries(0)
+    }
+
+    /// Like `open`, but retries a few times — useful right after the host
+    /// resumes from sleep, when the kernel may take a beat to re-enumerate
+    /// the USB device.
+    pub fn open_with_retries(extra_retries: u32) -> Result<Self> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..=extra_retries {
+            match Self::try_open() {
+                Ok(m) => {
+                    if attempt > 0 {
+                        log::info!("Re-opened Beacn Mix after {attempt} retries");
+                    }
+                    return Ok(m);
+                }
+                Err(e) => {
+                    log::debug!("open attempt {attempt} failed: {e:#}");
+                    last_err = Some(e);
+                    if attempt < extra_retries {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("No Beacn Mix found (expected USB 33ae:0004)")))
+    }
+
+    fn try_open() -> Result<Self> {
         let location = get_beacn_mix_device()
             .into_iter()
             .next()
@@ -72,18 +101,25 @@ impl Mix {
     }
 
     /// Device-liveness ping: keeps the firmware from powering the panel down.
-    pub fn keepalive(&self) {
-        if let Err(e) = self.device.send_keepalive() {
-            log::debug!("keepalive failed: {e}");
-        }
+    /// Returns an error when the device's event handler has exited (the crossbeam
+    /// channel is closed) — that's how callers detect a dead handle.
+    pub fn keepalive(&self) -> Result<()> {
+        self.device
+            .send_keepalive()
+            .map_err(|e| anyhow!("keepalive failed: {e}"))
     }
 
     /// Force the panel back on (after firmware sleep / host resume) at `brightness`,
     /// re-sending the enable/brightness/keepalive sequence; caller then redraws.
-    pub fn wake(&self, brightness: u8) {
-        let _ = self.device.set_enabled(true);
+    /// Returns an error if the device's event handler is gone (channel closed) —
+    /// the caller should treat that as "device disconnected, reconnect."
+    pub fn wake(&self, brightness: u8) -> Result<()> {
+        self.device
+            .set_enabled(true)
+            .map_err(|e| anyhow!("set_enabled failed: {e}"))?;
         self.set_brightness(brightness);
-        self.keepalive();
+        self.keepalive()?;
+        Ok(())
     }
 
     /// Draw a full-screen JPEG to the panel.

@@ -31,8 +31,13 @@ const VOLUME_MAX: i32 = 150;
 /// panel lit (dim or full) and beacn-lib's own dimmer never fires.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 /// A ticker gap longer than this means the host was suspended; on the next tick
-/// we re-wake the panel.
-const RESUME_GAP: Duration = Duration::from_secs(30);
+/// we re-wake the panel. Kept small so brief sleeps (a few seconds) still
+/// trigger the wake-up — the previous 30 s missed those entirely.
+const RESUME_GAP: Duration = Duration::from_secs(5);
+/// How long to wait between attempts to re-open the USB device after it
+/// disappears (disconnect, host resume, etc.). The kernel can take a beat to
+/// re-enumerate after a USB bus reset, so a single failure is normal.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Panel brightness state we drive ourselves (beacn-lib's auto-dim is suppressed).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,30 +210,32 @@ fn cmd_run() -> Result<()> {
     // Background: keep app streams routed to their bound channels.
     std::thread::spawn(auto_route_loop);
 
-    let mix = Mix::open()?;
+    // The Mix handle is held in an Option so we can drop and re-open it when
+    // the USB device dies (host resume after suspend, USB bus reset, cable
+    // unplug/replug). The first open uses no retries — if it fails we just
+    // bail, same as before. Later reconnects are retried.
+    let mut mix = Some(Mix::open()?);
 
     // The Mix reports its encoder state on the first poll after opening, which
     // arrives as a burst of large dial deltas. Discard anything buffered in the
     // first moment so we don't lurch every channel's volume at startup.
     std::thread::sleep(Duration::from_millis(400));
-    for _ in mix.events.try_iter() {}
+    if let Some(m) = mix.as_ref() {
+        for _ in m.events.try_iter() {}
+    }
 
-    // Optional backdrop image (loaded once; restart to pick up a change).
-    let background = state::background_path().and_then(|p| {
-        let bg = screen::load_background(&p);
-        if bg.is_some() {
-            log::info!("Using background image {}", p.display());
-        }
-        bg
-    });
+    // Optional backdrop image. Loaded once here, then reloaded on demand when the
+    // TUI bumps `DisplayConfig.background_generation` (so dropping a new
+    // background.jpg in the config dir can be picked up without a restart).
+    let mut background = load_background();
 
     // Display behaviour (dim timeout + brightness), re-read live from the TUI.
     let mut display = DisplayConfig::load().unwrap_or_default();
-    mix.init_display(display.full_brightness);
+    mix.as_ref().unwrap().init_display(display.full_brightness);
 
     let mut sources = channel_sources();
-    refresh_screen(
-        &mix,
+    let _ = refresh_screen(
+        mix.as_ref().unwrap(),
         &display,
         &sources,
         &volumes,
@@ -254,18 +261,77 @@ fn cmd_run() -> Result<()> {
     let mut last_activity = now;
     let mut last_liveness = now;
     let mut last_tick = now;
+    // Set when the event channel closes (device disconnected / host resume that
+    // broke the USB handle) so the next loop iteration reconnects.
+    let mut device_dead = false;
+    // Throttle reconnection attempts — the kernel can take a beat to re-enumerate
+    // after a USB bus reset, but we don't want to spin at 100% CPU if it's gone
+    // for good.
+    let mut last_reconnect = Instant::now() - RECONNECT_BACKOFF;
 
     loop {
+        // Reconnect first thing in each iteration. We can't do this inside
+        // select! because `mix.events` borrows `mix` for the whole block.
+        if device_dead || mix.is_none() {
+            let now = Instant::now();
+            if now.duration_since(last_reconnect) >= RECONNECT_BACKOFF {
+                last_reconnect = now;
+                log::warn!("Beacn Mix disconnected, attempting to reconnect...");
+                // Drop the old (dead) handle before re-opening.
+                mix = None;
+                match Mix::open_with_retries(3) {
+                    Ok(new_mix) => {
+                        // Same startup-burst drain as the initial open.
+                        std::thread::sleep(Duration::from_millis(400));
+                        for _ in new_mix.events.try_iter() {}
+                        new_mix.init_display(brightness_for(screen, &display));
+                        // Push a fresh frame so the panel is showing something,
+                        // not the dim/black state the firmware left it in.
+                        if let Err(e) = refresh_screen(
+                            &new_mix,
+                            &display,
+                            &sources,
+                            &volumes,
+                            &mutes,
+                            background.as_ref(),
+                        ) {
+                            log::warn!("post-reconnect screen push failed: {e:#}");
+                        }
+                        mix = Some(new_mix);
+                        device_dead = false;
+                        last_activity = now;
+                        last_liveness = now;
+                        last_tick = now;
+                        log::info!("Reconnected to Beacn Mix.");
+                    }
+                    Err(e) => {
+                        log::warn!("Reconnect failed: {e:#}");
+                    }
+                }
+            }
+        }
+
+        let Some(mix_ref) = mix.as_ref() else {
+            // Still disconnected and inside the backoff window — sleep a tick
+            // and try again.
+            std::thread::sleep(Duration::from_millis(150));
+            continue;
+        };
+
         select! {
-            recv(mix.events) -> msg => match msg {
+            recv(mix_ref.events) -> msg => match msg {
                 Ok(event) => {
                     // Any hardware input counts as activity: reset the dim timer
                     // and, if the panel had dimmed, bring it back to full.
                     last_activity = Instant::now();
                     if screen == Screen::Dimmed {
-                        mix.wake(display.full_brightness);
-                        screen = Screen::Active;
-                        dirty = true;
+                        if let Err(e) = mix_ref.wake(display.full_brightness) {
+                            log::warn!("wake failed (will reconnect): {e:#}");
+                            device_dead = true;
+                        } else {
+                            screen = Screen::Active;
+                            dirty = true;
+                        }
                     }
 
                     match event {
@@ -297,8 +363,11 @@ fn cmd_run() -> Result<()> {
                     }
                 }
                 Err(_) => {
-                    log::warn!("Event stream ended (device disconnected?).");
-                    break;
+                    // Event channel closed: the device's event-handler thread in
+                    // beacn-lib has exited (USB error, device gone). Reconnect on
+                    // the next iteration.
+                    log::warn!("Event stream ended (device disconnected); will reconnect.");
+                    device_dead = true;
                 }
             },
             recv(ui) -> _ => {
@@ -307,15 +376,24 @@ fn cmd_run() -> Result<()> {
                 // A large gap between ticks means the host was suspended; the
                 // panel will have powered off, so re-wake it.
                 if now.duration_since(last_tick) > RESUME_GAP {
-                    mix.wake(display.full_brightness);
-                    screen = Screen::Active;
-                    last_activity = now;
-                    dirty = true;
+                    if let Err(e) = mix_ref.wake(display.full_brightness) {
+                        log::warn!("post-resume wake failed (will reconnect): {e:#}");
+                        device_dead = true;
+                    } else {
+                        screen = Screen::Active;
+                        last_activity = now;
+                        dirty = true;
+                    }
                 }
                 last_tick = now;
 
                 if dirty {
-                    refresh_screen(&mix, &display, &sources, &volumes, &mutes, background.as_ref());
+                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, background.as_ref()) {
+                        // Transport failure = the device is gone. Anything else
+                        // (e.g. a JPEG decoder hiccup) is logged inside refresh_screen.
+                        log::warn!("screen update failed: {e}");
+                        device_dead = true;
+                    }
                     dirty = false;
                 }
                 if levels_dirty {
@@ -334,15 +412,23 @@ fn cmd_run() -> Result<()> {
                         dirty = true;
                         last_activity = now;
                         if screen == Screen::Dimmed {
-                            mix.wake(display.full_brightness);
-                            screen = Screen::Active;
+                            if let Err(e) = mix_ref.wake(display.full_brightness) {
+                                log::warn!("wake after routing change failed: {e:#}");
+                                device_dead = true;
+                            } else {
+                                screen = Screen::Active;
+                            }
                         }
                     }
                     let cfg = DisplayConfig::load().unwrap_or_default();
                     if cfg != display {
+                        // A bumped generation is the TUI's "reload background" signal.
+                        if cfg.background_generation != display.background_generation {
+                            background = load_background();
+                        }
                         display = cfg;
-                        mix.set_brightness(brightness_for(screen, &display));
-                        dirty = true; // names may have changed; redraw the panel
+                        mix_ref.set_brightness(brightness_for(screen, &display));
+                        dirty = true; // names/background may have changed; redraw the panel
                     }
                 }
 
@@ -350,25 +436,37 @@ fn cmd_run() -> Result<()> {
                 if screen == Screen::Active
                     && now.duration_since(last_activity) >= Duration::from_secs(display.dim_after_secs)
                 {
-                    mix.set_brightness(display.dim_brightness);
+                    mix_ref.set_brightness(display.dim_brightness);
                     screen = Screen::Dimmed;
                 }
 
                 // Periodically re-assert brightness + ping the device so it keeps
                 // the panel lit and beacn-lib's own dimmer never takes over.
                 if now.duration_since(last_liveness) >= LIVENESS_INTERVAL {
-                    mix.keepalive();
-                    mix.keep_awake();
-                    mix.set_brightness(brightness_for(screen, &display));
+                    if let Err(e) = mix_ref.keepalive() {
+                        log::warn!("keepalive failed (will reconnect): {e}");
+                        device_dead = true;
+                    } else {
+                        mix_ref.keep_awake();
+                        mix_ref.set_brightness(brightness_for(screen, &display));
+                    }
                     last_liveness = now;
                 }
-            }
+            },
         }
     }
+}
 
-    // Persist the final state on a clean shutdown.
-    let _ = Levels { volumes, mutes }.save();
-    Ok(())
+/// Load the optional panel backdrop from the config dir, logging what it found.
+/// Returns `None` (solid colour) when no usable image is present.
+fn load_background() -> Option<RgbImage> {
+    state::background_path().and_then(|p| {
+        let bg = screen::load_background(&p);
+        if bg.is_some() {
+            log::info!("Using background image {}", p.display());
+        }
+        bg
+    })
 }
 
 /// Brightness for the current panel state.
@@ -379,7 +477,9 @@ fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
     }
 }
 
-/// Build the four channel tiles from precomputed sources + current volumes/mutes.
+/// Build the four channel tiles from precomputed sources + current volumes/mutes
+/// and push them to the device. Returns `Err` only on transport failure (device
+/// gone) — a render failure is logged and treated as non-fatal.
 fn refresh_screen(
     mix: &Mix,
     display: &DisplayConfig,
@@ -387,21 +487,21 @@ fn refresh_screen(
     volumes: &[u32; 4],
     mutes: &[bool; 4],
     background: Option<&RgbImage>,
-) {
+) -> Result<()> {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
         label: display.channel_label(i),
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),
     });
-    match screen::render(&views, background) {
-        Ok(jpeg) => {
-            if let Err(e) = mix.set_screen(&jpeg) {
-                log::warn!("screen update failed: {e}");
-            }
+    let jpeg = match screen::render(&views, background) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("render failed: {e}");
+            return Ok(());
         }
-        Err(e) => log::warn!("render failed: {e}"),
-    }
+    };
+    mix.set_screen(&jpeg)
 }
 
 /// Per-channel source list for the panel, derived from **live routing** — the

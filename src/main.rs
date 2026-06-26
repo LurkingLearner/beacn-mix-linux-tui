@@ -16,6 +16,7 @@ use beacn_lib::controller::{ButtonState, Interactions};
 use beacn_lib::crossbeam::channel::tick;
 use beacn_lib::crossbeam::select;
 use clap::{Parser, Subcommand};
+use image::RgbImage;
 use mix::{channel_for_button, channel_for_dial, Channel, Mix};
 use screen::ChannelView;
 use state::{Bindings, Levels, Modules};
@@ -98,7 +99,8 @@ fn cmd_preview(path: &str) -> Result<()> {
             apps: vec![],
         },
     ];
-    let jpeg = screen::render(&views)?;
+    let background = state::background_path().and_then(|p| screen::load_background(&p));
+    let jpeg = screen::render(&views, background.as_ref())?;
     std::fs::write(path, &jpeg).with_context(|| format!("writing {path}"))?;
     println!("Wrote sample panel ({} bytes) to {path}", jpeg.len());
     Ok(())
@@ -197,9 +199,18 @@ fn cmd_run() -> Result<()> {
     std::thread::sleep(Duration::from_millis(400));
     for _ in mix.events.try_iter() {}
 
+    // Optional backdrop image (loaded once; restart to pick up a change).
+    let background = state::background_path().and_then(|p| {
+        let bg = screen::load_background(&p);
+        if bg.is_some() {
+            log::info!("Using background image {}", p.display());
+        }
+        bg
+    });
+
     mix.init_display();
     let mut sources = channel_sources();
-    refresh_screen(&mix, &sources, &volumes, &mutes);
+    refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
 
     log::info!(
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
@@ -261,7 +272,7 @@ fn cmd_run() -> Result<()> {
             },
             recv(ui) -> _ => {
                 if dirty {
-                    refresh_screen(&mix, &sources, &volumes, &mutes);
+                    refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
                     dirty = false;
                 }
                 if levels_dirty {
@@ -291,13 +302,19 @@ fn cmd_run() -> Result<()> {
 }
 
 /// Build the four channel tiles from precomputed sources + current volumes/mutes.
-fn refresh_screen(mix: &Mix, sources: &[Vec<String>; 4], volumes: &[u32; 4], mutes: &[bool; 4]) {
+fn refresh_screen(
+    mix: &Mix,
+    sources: &[Vec<String>; 4],
+    volumes: &[u32; 4],
+    mutes: &[bool; 4],
+    background: Option<&RgbImage>,
+) {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),
     });
-    match screen::render(&views) {
+    match screen::render(&views, background) {
         Ok(jpeg) => {
             if let Err(e) = mix.set_screen(&jpeg) {
                 log::warn!("screen update failed: {e}");

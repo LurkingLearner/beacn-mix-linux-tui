@@ -22,6 +22,16 @@ fn bindings_path() -> PathBuf {
     base_dir("XDG_CONFIG_HOME", ".config").join("bindings.json")
 }
 
+/// First existing `background.{png,jpg,jpeg}` in the config dir, if any. Drop an
+/// image there to use it as the panel backdrop (solid colour is used otherwise).
+pub fn background_path() -> Option<PathBuf> {
+    let dir = base_dir("XDG_CONFIG_HOME", ".config");
+    ["background.png", "background.jpg", "background.jpeg"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.exists())
+}
+
 fn modules_path() -> PathBuf {
     base_dir("XDG_STATE_HOME", ".local/state").join("modules.json")
 }

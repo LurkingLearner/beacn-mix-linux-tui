@@ -5,12 +5,14 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, Result};
+use image::imageops::FilterType;
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{
     draw_filled_circle_mut, draw_filled_rect_mut, draw_polygon_mut, draw_text_mut,
 };
 use imageproc::point::Point;
 use imageproc::rect::Rect;
+use std::path::Path;
 
 const W: u32 = 800;
 const H: u32 = 480;
@@ -23,6 +25,10 @@ const DIM: Rgb<u8> = Rgb([120, 126, 140]);
 const TRACK: Rgb<u8> = Rgb([40, 44, 54]);
 const MUTE: Rgb<u8> = Rgb([224, 80, 80]);
 const MUTE_ARC: Rgb<u8> = Rgb([120, 62, 66]);
+
+/// How much to darken a background image so the overlays stay legible (0 = black,
+/// 1 = untouched).
+const SCRIM: f32 = 0.45;
 
 /// Per-channel accent colour (left→right).
 const ACCENT: [Rgb<u8>; 4] = [
@@ -57,10 +63,36 @@ pub struct ChannelView {
     pub apps: Vec<String>,
 }
 
-/// Render the four tiles into a JPEG suitable for `set_image(0, 0, ..)`.
-pub fn render(views: &[ChannelView; 4]) -> Result<Vec<u8>> {
+/// Load a backdrop image, scaled to cover 800×480 and darkened for legibility.
+/// Returns `None` (and logs) on a missing/undecodable file so the caller falls
+/// back to the solid colour. Do this once and reuse it — decoding is not cheap.
+pub fn load_background(path: &Path) -> Option<RgbImage> {
+    match image::open(path) {
+        Ok(img) => {
+            let mut rgb = img.resize_to_fill(W, H, FilterType::Triangle).to_rgb8();
+            for px in rgb.pixels_mut() {
+                for c in px.0.iter_mut() {
+                    *c = (*c as f32 * SCRIM) as u8;
+                }
+            }
+            Some(rgb)
+        }
+        Err(e) => {
+            log::warn!("could not load background {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Render the four tiles into a JPEG suitable for `set_image(0, 0, ..)`. With a
+/// `background` (already sized to 800×480) the gauges are drawn over it; without
+/// one a solid colour is used.
+pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<Vec<u8>> {
     let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
-    let mut img = RgbImage::from_pixel(W, H, BG);
+    let mut img = match background {
+        Some(bg) => bg.clone(),
+        None => RgbImage::from_pixel(W, H, BG),
+    };
 
     for (i, view) in views.iter().enumerate() {
         let x0 = i as u32 * COL_W;

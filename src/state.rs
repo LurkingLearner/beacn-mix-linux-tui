@@ -40,6 +40,10 @@ fn levels_path() -> PathBuf {
     base_dir("XDG_STATE_HOME", ".local/state").join("levels.json")
 }
 
+fn display_path() -> PathBuf {
+    base_dir("XDG_CONFIG_HOME", ".config").join("display.json")
+}
+
 fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &PathBuf) -> Result<T> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)
@@ -121,6 +125,39 @@ impl Levels {
 
     pub fn save(&self) -> Result<()> {
         save_json(&levels_path(), self)
+    }
+}
+
+/// Panel display behaviour, edited from the TUI Settings page and re-read live by
+/// the `run` daemon. Brightness values are percentages (1..=100); the device
+/// rejects 0, so the dim level is a low-but-visible value, not off.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayConfig {
+    /// Idle time before the panel dims, in seconds.
+    pub dim_after_secs: u64,
+    /// Brightness while active.
+    pub full_brightness: u8,
+    /// Brightness once dimmed.
+    pub dim_brightness: u8,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            dim_after_secs: 300,
+            full_brightness: 80,
+            dim_brightness: 12,
+        }
+    }
+}
+
+impl DisplayConfig {
+    pub fn load() -> Result<Self> {
+        load_json(&display_path())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        save_json(&display_path(), self)
     }
 }
 

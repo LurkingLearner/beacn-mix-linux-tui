@@ -40,8 +40,9 @@ cargo build --release
 ./target/release/beacn-mix teardown
 ```
 
-The `tui` runs alongside the `run` daemon (it never opens the device), showing
-which apps are on each channel and letting you assign/move/unassign them.
+The `tui` runs alongside the `run` daemon (it never opens the device). It has two
+pages (`Tab` to switch): **Routing** (which apps are on each channel; assign / move /
+unassign) and **Settings** (panel dim timeout + brightness — see below).
 
 Bindings (app → channel) persist to `~/.config/beacn-mix-linux/bindings.json`;
 the `run` daemon re-routes a bound app onto its channel whenever it reappears.
@@ -49,9 +50,17 @@ Channel volumes/mutes persist to `~/.local/state/beacn-mix-linux/levels.json`
 and are restored on the next `run`.
 
 The panel shows a Beacn-style arc gauge per channel (volume integer, mute icon)
-with the channel label and its grouped source apps. It will enter the device's
-low-power screen-off when idle; the next encoder turn or button press wakes it
-and redraws. Preview the layout without hardware via `beacn-mix preview`.
+with the channel label and its grouped source apps. After an idle period it **dims**
+to a low-but-visible brightness (it does not turn off); a knob turn, button press, or
+a routing change in the TUI restores full brightness. Preview the layout without
+hardware via `beacn-mix preview`.
+
+### Display settings
+
+Open `beacn-mix tui`, press `Tab` to the **Settings** page, and adjust **Dim after**
+(idle minutes before dimming), **Full brightness**, and **Dim brightness** with
+`←/→`. Changes save to `~/.config/beacn-mix-linux/display.json` and the running daemon
+applies them within ~1 s.
 
 ### Custom background
 

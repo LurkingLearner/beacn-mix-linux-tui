@@ -1,12 +1,16 @@
-//! A small terminal UI for managing channel routing — see at a glance which
-//! apps are on which channel, and assign / move / unassign them. It never opens
-//! the Mix (the running daemon owns the USB interface): it only edits the same
-//! `bindings.json` and PipeWire graph the daemon already reacts to. Volume/mute
-//! stay read-only here — the hardware knobs remain the source of truth.
+//! A small terminal UI with two pages:
+//!  - **Routing**: see which apps are on which channel, and assign / move /
+//!    unassign them.
+//!  - **Settings**: edit the panel display behaviour (dim timeout + brightness).
+//!
+//! It never opens the Mix (the running daemon owns the USB interface): it only
+//! edits the same `bindings.json` / `display.json` and PipeWire graph the daemon
+//! already reacts to. Volume/mute stay read-only here — the knobs are the source
+//! of truth. `Tab` switches pages; `q` quits.
 
 use crate::mix::Channel;
 use crate::pw;
-use crate::state::{Bindings, Levels};
+use crate::state::{Bindings, DisplayConfig, Levels};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -14,10 +18,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use std::collections::HashSet;
 use std::io;
@@ -30,6 +34,15 @@ const ACCENT: [Color; 4] = [
     Color::Rgb(214, 162, 86),  // amber
     Color::Rgb(190, 130, 240), // violet
 ];
+
+/// Number of editable rows on the Settings page.
+const SETTINGS_FIELDS: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Routing,
+    Settings,
+}
 
 /// One manageable entry: either a live playback stream or an app that's bound to
 /// a channel but isn't currently playing.
@@ -137,6 +150,28 @@ fn unassign(row: &Row) -> Result<()> {
     bindings.save()
 }
 
+/// Nudge a settings field by `dir` (±1), each field with its own step + bounds.
+fn adjust(cfg: &mut DisplayConfig, field: usize, dir: i64) {
+    match field {
+        0 => {
+            let min = (cfg.dim_after_secs as i64 / 60 + dir).clamp(1, 120);
+            cfg.dim_after_secs = (min * 60) as u64;
+        }
+        1 => cfg.full_brightness = (cfg.full_brightness as i64 + dir * 5).clamp(5, 100) as u8,
+        2 => cfg.dim_brightness = (cfg.dim_brightness as i64 + dir).clamp(1, 100) as u8,
+        _ => {}
+    }
+}
+
+struct App {
+    page: Page,
+    snap: Snapshot,
+    routing: ListState,
+    settings: ListState,
+    display: DisplayConfig,
+    status: String,
+}
+
 /// Restore the terminal even on early return / panic.
 struct TermGuard;
 impl Drop for TermGuard {
@@ -160,25 +195,32 @@ pub fn run() -> Result<()> {
     }));
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut state = ListState::default();
-    state.select(Some(0));
-    let mut snap = snapshot();
-    let mut status = String::new();
+
+    let mut routing = ListState::default();
+    routing.select(Some(0));
+    let mut settings = ListState::default();
+    settings.select(Some(0));
+    let mut app = App {
+        page: Page::Routing,
+        snap: snapshot(),
+        routing,
+        settings,
+        display: DisplayConfig::load().unwrap_or_default(),
+        status: String::new(),
+    };
 
     loop {
-        // Keep the selection within bounds as streams come and go.
-        if snap.rows.is_empty() {
-            state.select(None);
-        } else {
-            let sel = state.selected().unwrap_or(0).min(snap.rows.len() - 1);
-            state.select(Some(sel));
-        }
+        // Keep selections within bounds as streams come and go.
+        clamp_selection(&mut app.routing, app.snap.rows.len());
+        clamp_selection(&mut app.settings, SETTINGS_FIELDS);
 
-        terminal.draw(|f| ui(f, &snap, &mut state, &status))?;
+        terminal.draw(|f| draw(f, &mut app))?;
 
-        // Block briefly for input; on timeout, just refresh the snapshot.
+        // Block briefly for input; on timeout, refresh the routing snapshot.
         if !event::poll(Duration::from_millis(750))? {
-            snap = snapshot();
+            if app.page == Page::Routing {
+                app.snap = snapshot();
+            }
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -188,72 +230,151 @@ pub fn run() -> Result<()> {
             continue;
         }
 
-        let selected = state.selected().and_then(|i| snap.rows.get(i).cloned());
+        // Global keys.
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Up | KeyCode::Char('k') => {
-                let cur = state.selected().unwrap_or(0);
-                state.select(Some(cur.saturating_sub(1)));
-                status.clear();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !snap.rows.is_empty() {
-                    let cur = state.selected().unwrap_or(0);
-                    state.select(Some((cur + 1).min(snap.rows.len() - 1)));
-                }
-                status.clear();
-            }
-            KeyCode::Char(c @ '1'..='4') => {
-                if let Some(row) = &selected {
-                    let ch = Channel(c as usize - '1' as usize);
-                    status = match assign(row, ch) {
-                        Ok(()) => format!("Assigned {} → CH{}", row.app(), ch.human()),
-                        Err(e) => format!("Assign failed: {e}"),
-                    };
-                }
-                snap = snapshot();
-            }
-            KeyCode::Char('u') => {
-                if let Some(row) = &selected {
-                    status = match unassign(row) {
-                        Ok(()) => format!("Unassigned {}", row.app()),
-                        Err(e) => format!("Unassign failed: {e}"),
-                    };
-                }
-                snap = snapshot();
-            }
-            KeyCode::Char('r') => {
-                snap = snapshot();
-                status.clear();
+            KeyCode::Tab => {
+                app.page = match app.page {
+                    Page::Routing => Page::Settings,
+                    Page::Settings => Page::Routing,
+                };
+                app.status.clear();
+                continue;
             }
             _ => {}
+        }
+
+        match app.page {
+            Page::Routing => handle_routing_key(&mut app, key.code),
+            Page::Settings => handle_settings_key(&mut app, key.code),
         }
     }
 
     Ok(())
 }
 
-fn ui(f: &mut Frame, snap: &Snapshot, state: &mut ListState, status: &str) {
+fn clamp_selection(state: &mut ListState, len: usize) {
+    if len == 0 {
+        state.select(None);
+    } else {
+        state.select(Some(state.selected().unwrap_or(0).min(len - 1)));
+    }
+}
+
+fn handle_routing_key(app: &mut App, code: KeyCode) {
+    let selected = app
+        .routing
+        .selected()
+        .and_then(|i| app.snap.rows.get(i).cloned());
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let cur = app.routing.selected().unwrap_or(0);
+            app.routing.select(Some(cur.saturating_sub(1)));
+            app.status.clear();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.snap.rows.is_empty() {
+                let cur = app.routing.selected().unwrap_or(0);
+                app.routing
+                    .select(Some((cur + 1).min(app.snap.rows.len() - 1)));
+            }
+            app.status.clear();
+        }
+        KeyCode::Char(c @ '1'..='4') => {
+            if let Some(row) = &selected {
+                let ch = Channel(c as usize - '1' as usize);
+                app.status = match assign(row, ch) {
+                    Ok(()) => format!("Assigned {} → CH{}", row.app(), ch.human()),
+                    Err(e) => format!("Assign failed: {e}"),
+                };
+            }
+            app.snap = snapshot();
+        }
+        KeyCode::Char('u') => {
+            if let Some(row) = &selected {
+                app.status = match unassign(row) {
+                    Ok(()) => format!("Unassigned {}", row.app()),
+                    Err(e) => format!("Unassign failed: {e}"),
+                };
+            }
+            app.snap = snapshot();
+        }
+        KeyCode::Char('r') => {
+            app.snap = snapshot();
+            app.status.clear();
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_key(app: &mut App, code: KeyCode) {
+    let field = app.settings.selected().unwrap_or(0);
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.settings.select(Some(field.saturating_sub(1)));
+            app.status.clear();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.settings
+                .select(Some((field + 1).min(SETTINGS_FIELDS - 1)));
+            app.status.clear();
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => save_adjust(app, field, -1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=') => {
+            save_adjust(app, field, 1)
+        }
+        _ => {}
+    }
+}
+
+fn save_adjust(app: &mut App, field: usize, dir: i64) {
+    adjust(&mut app.display, field, dir);
+    app.status = match app.display.save() {
+        Ok(()) => "Saved — the daemon applies it within ~1s.".to_string(),
+        Err(e) => format!("Save failed: {e}"),
+    };
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(f.area());
+
+    let tab = match app.page {
+        Page::Routing => 0,
+        Page::Settings => 1,
+    };
+    let tabs = Tabs::new(vec![" Routing ", " Settings "])
+        .select(tab)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .divider("");
+    f.render_widget(tabs, chunks[0]);
+
+    match app.page {
+        Page::Routing => draw_routing(f, chunks[1], app),
+        Page::Settings => draw_settings(f, chunks[1], app),
+    }
+}
+
+fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(11), // channel panels
         Constraint::Min(3),     // selectable stream list
         Constraint::Length(1),  // help / status
     ])
-    .split(f.area());
+    .split(area);
 
     // Four channel panels, each listing the apps routed to it.
     let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(chunks[0]);
     for (i, col) in cols.iter().enumerate() {
         let ch = Channel(i);
-        let vol = snap.levels.volumes[i];
-        let title = if snap.levels.mutes[i] {
+        let vol = app.snap.levels.volumes[i];
+        let title = if app.snap.levels.mutes[i] {
             format!(" CH{}  {vol}%  MUTE ", ch.human())
         } else {
             format!(" CH{}  {vol}% ", ch.human())
         };
 
         let mut lines: Vec<Line> = Vec::new();
-        for row in &snap.rows {
+        for row in &app.snap.rows {
             if row.channel() == Some(ch) {
                 match row {
                     Row::Live { label, .. } => lines.push(Line::from(label.clone())),
@@ -275,7 +396,8 @@ fn ui(f: &mut Frame, snap: &Snapshot, state: &mut ListState, status: &str) {
     }
 
     // The selectable list of all streams + idle bound apps.
-    let items: Vec<ListItem> = snap
+    let items: Vec<ListItem> = app
+        .snap
         .rows
         .iter()
         .map(|r| ListItem::new(r.display()))
@@ -284,16 +406,45 @@ fn ui(f: &mut Frame, snap: &Snapshot, state: &mut ListState, status: &str) {
         .block(Block::bordered().title(" Streams — select, then 1-4 to assign "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, chunks[1], state);
+    f.render_stateful_widget(list, chunks[1], &mut app.routing);
 
-    // Help line, or the last action's status if there is one.
-    let help = if status.is_empty() {
-        "↑/↓ select · 1-4 assign · u unassign · r refresh · q quit".to_string()
+    let help = if app.status.is_empty() {
+        "↑/↓ select · 1-4 assign · u unassign · r refresh · Tab settings · q quit".to_string()
     } else {
-        status.to_string()
+        app.status.clone()
     };
     f.render_widget(
         Paragraph::new(Line::styled(help, Style::new().fg(Color::Gray))),
         chunks[2],
+    );
+}
+
+fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+
+    let d = &app.display;
+    let fields = [
+        ("Dim after", format!("{} min", d.dim_after_secs / 60)),
+        ("Full brightness", format!("{}%", d.full_brightness)),
+        ("Dim brightness", format!("{}%", d.dim_brightness)),
+    ];
+    let items: Vec<ListItem> = fields
+        .iter()
+        .map(|(name, val)| ListItem::new(format!("  {name:<18}{val}")))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(" Panel display "))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[0], &mut app.settings);
+
+    let help = if app.status.is_empty() {
+        "↑/↓ select · ←/→ (or -/+) adjust · Tab routing · q quit".to_string()
+    } else {
+        app.status.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Line::styled(help, Style::new().fg(Color::Gray))),
+        chunks[1],
     );
 }

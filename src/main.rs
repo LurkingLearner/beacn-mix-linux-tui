@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use image::RgbImage;
 use mix::{channel_for_button, channel_for_dial, Channel, Mix};
 use screen::ChannelView;
-use state::{Bindings, Levels, Modules};
+use state::{Bindings, DisplayConfig, Levels, Modules};
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -27,9 +27,19 @@ use std::time::{Duration, Instant};
 /// How much each encoder tick moves a channel's volume, in percent.
 const VOLUME_STEP: i32 = 2;
 const VOLUME_MAX: i32 = 150;
-/// If this long passes with no input, assume the panel slept and wake it on the
-/// next interaction.
-const WAKE_AFTER_IDLE: Duration = Duration::from_secs(20);
+/// How often to re-assert brightness + ping the device so the firmware keeps the
+/// panel lit (dim or full) and beacn-lib's own dimmer never fires.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
+/// A ticker gap longer than this means the host was suspended; on the next tick
+/// we re-wake the panel.
+const RESUME_GAP: Duration = Duration::from_secs(30);
+
+/// Panel brightness state we drive ourselves (beacn-lib's auto-dim is suppressed).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Active,
+    Dimmed,
+}
 
 #[derive(Parser)]
 #[command(
@@ -208,7 +218,10 @@ fn cmd_run() -> Result<()> {
         bg
     });
 
-    mix.init_display();
+    // Display behaviour (dim timeout + brightness), re-read live from the TUI.
+    let mut display = DisplayConfig::load().unwrap_or_default();
+    mix.init_display(display.full_brightness);
+
     let mut sources = channel_sources();
     refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
 
@@ -217,25 +230,32 @@ fn cmd_run() -> Result<()> {
     );
 
     // Coalesce screen updates onto a ticker so fast knob spins don't flood the
-    // panel with full-frame JPEGs; re-arm the dim timer periodically.
+    // panel with full-frame JPEGs.
     let ui = tick(Duration::from_millis(150));
     let mut dirty = false;
     let mut levels_dirty = false;
     let mut ticks: u32 = 0;
-    let mut last_event = Instant::now();
+
+    // Panel power: dim after `display.dim_after_secs` of no activity, restore on
+    // any input or TUI routing change. Activity = knob/button or a sources change.
+    let mut screen = Screen::Active;
+    let now = Instant::now();
+    let mut last_activity = now;
+    let mut last_liveness = now;
+    let mut last_tick = now;
 
     loop {
         select! {
             recv(mix.events) -> msg => match msg {
                 Ok(event) => {
-                    // First input after an idle gap: the panel has likely gone
-                    // into firmware sleep, so wake it before redrawing.
-                    let now = Instant::now();
-                    if now.duration_since(last_event) > WAKE_AFTER_IDLE {
-                        mix.wake();
+                    // Any hardware input counts as activity: reset the dim timer
+                    // and, if the panel had dimmed, bring it back to full.
+                    last_activity = Instant::now();
+                    if screen == Screen::Dimmed {
+                        mix.wake(display.full_brightness);
+                        screen = Screen::Active;
                         dirty = true;
                     }
-                    last_event = now;
 
                     match event {
                         Interactions::DialChanged(dial, delta) => {
@@ -271,6 +291,18 @@ fn cmd_run() -> Result<()> {
                 }
             },
             recv(ui) -> _ => {
+                let now = Instant::now();
+
+                // A large gap between ticks means the host was suspended; the
+                // panel will have powered off, so re-wake it.
+                if now.duration_since(last_tick) > RESUME_GAP {
+                    mix.wake(display.full_brightness);
+                    screen = Screen::Active;
+                    last_activity = now;
+                    dirty = true;
+                }
+                last_tick = now;
+
                 if dirty {
                     refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
                     dirty = false;
@@ -280,17 +312,43 @@ fn cmd_run() -> Result<()> {
                     levels_dirty = false;
                 }
                 ticks += 1;
-                // Re-poll routing roughly once a second so panel labels track
-                // assign/unassign done in the TUI without needing a knob turn.
+
+                // Roughly once a second: re-poll routing (so panel labels track
+                // TUI assign/unassign) and re-read the display config (so Settings
+                // edits apply live). A routing change also counts as activity.
                 if ticks.is_multiple_of(7) {
                     let next = channel_sources();
                     if next != sources {
                         sources = next;
                         dirty = true;
+                        last_activity = now;
+                        if screen == Screen::Dimmed {
+                            mix.wake(display.full_brightness);
+                            screen = Screen::Active;
+                        }
+                    }
+                    let cfg = DisplayConfig::load().unwrap_or_default();
+                    if cfg != display {
+                        display = cfg;
+                        mix.set_brightness(brightness_for(screen, &display));
                     }
                 }
-                if ticks.is_multiple_of(200) {
+
+                // Dim after the configured idle period.
+                if screen == Screen::Active
+                    && now.duration_since(last_activity) >= Duration::from_secs(display.dim_after_secs)
+                {
+                    mix.set_brightness(display.dim_brightness);
+                    screen = Screen::Dimmed;
+                }
+
+                // Periodically re-assert brightness + ping the device so it keeps
+                // the panel lit and beacn-lib's own dimmer never takes over.
+                if now.duration_since(last_liveness) >= LIVENESS_INTERVAL {
+                    mix.keepalive();
                     mix.keep_awake();
+                    mix.set_brightness(brightness_for(screen, &display));
+                    last_liveness = now;
                 }
             }
         }
@@ -299,6 +357,14 @@ fn cmd_run() -> Result<()> {
     // Persist the final state on a clean shutdown.
     let _ = Levels { volumes, mutes }.save();
     Ok(())
+}
+
+/// Brightness for the current panel state.
+fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
+    match screen {
+        Screen::Active => display.full_brightness,
+        Screen::Dimmed => display.dim_brightness,
+    }
 }
 
 /// Build the four channel tiles from precomputed sources + current volumes/mutes.

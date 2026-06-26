@@ -47,29 +47,43 @@ impl Mix {
         })
     }
 
-    /// Set the panel brightness (1..=100) and push the dim timer to its max, so
-    /// the screen stays readable while the mixer runs.
-    pub fn init_display(&self) {
-        if let Err(e) = self.device.set_display_brightness(80) {
-            log::warn!("set brightness failed: {e}");
-        }
+    /// Set the panel to `brightness` (1..=100) and suppress beacn-lib's own
+    /// dimmer, so we own the brightness for the rest of the session.
+    pub fn init_display(&self, brightness: u8) {
+        self.set_brightness(brightness);
         self.keep_awake();
     }
 
-    /// Re-arm the dim timer (call periodically). beacn-lib caps this at 5 min.
+    /// Set the panel brightness (clamped to the device's 1..=100). We drive this
+    /// ourselves for the Active/Dimmed states instead of leaning on beacn-lib's
+    /// auto-dim (which only ever drops to 1%, i.e. near-black).
+    pub fn set_brightness(&self, pct: u8) {
+        if let Err(e) = self.device.set_display_brightness(pct.clamp(1, 100)) {
+            log::warn!("set brightness failed: {e}");
+        }
+    }
+
+    /// Re-arm beacn-lib's dim timer to its max. We call this faster than the
+    /// timer length, so the library's own dim-to-1% never fires and fights us.
     pub fn keep_awake(&self) {
         if let Err(e) = self.device.set_dim_timeout(Duration::from_secs(300)) {
             log::debug!("set dim timeout failed: {e}");
         }
     }
 
-    /// Force the panel back on after the device's firmware screen-off. beacn-lib
-    /// doesn't track that deep sleep, so we re-send the enable/brightness/wake
-    /// sequence; the caller should then redraw.
-    pub fn wake(&self) {
+    /// Device-liveness ping: keeps the firmware from powering the panel down.
+    pub fn keepalive(&self) {
+        if let Err(e) = self.device.send_keepalive() {
+            log::debug!("keepalive failed: {e}");
+        }
+    }
+
+    /// Force the panel back on (after firmware sleep / host resume) at `brightness`,
+    /// re-sending the enable/brightness/keepalive sequence; caller then redraws.
+    pub fn wake(&self, brightness: u8) {
         let _ = self.device.set_enabled(true);
-        let _ = self.device.set_display_brightness(80);
-        let _ = self.device.send_keepalive();
+        self.set_brightness(brightness);
+        self.keepalive();
     }
 
     /// Draw a full-screen JPEG to the panel.

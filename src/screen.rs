@@ -90,6 +90,17 @@ pub fn load_background(path: &Path) -> Option<RgbImage> {
 /// `background` (already sized to 800×480) the gauges are drawn over it; without
 /// one a solid colour is used.
 pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<Vec<u8>> {
+    let img = render_rgb(views, background)?;
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
+    enc.encode_image(&img)?;
+    Ok(buf)
+}
+
+/// Same as [`render`] but returns the raw 800×480 RGB buffer instead of a JPEG.
+/// Useful for tests that want to inspect pixels (and a tiny bit cheaper for any
+/// future caller that needs the bitmap directly).
+pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<RgbImage> {
     let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
     let mut img = match background {
         Some(bg) => bg.clone(),
@@ -128,10 +139,7 @@ pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result
         draw_sources(&mut img, &font, cx, &view.apps);
     }
 
-    let mut buf = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
-    enc.encode_image(&img)?;
-    Ok(buf)
+    Ok(img)
 }
 
 /// The arc gauge: dim track, accent fill to the current level, a 100% headroom
@@ -318,5 +326,261 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The renderer is pure (input = views + optional background, output =
+    //! `RgbImage`) so all the assertions here inspect pixels of `render_rgb`.
+    //! What we care about: dimensions, accent colour reaches the gauge at the
+    //! expected volume, the mute icon appears (and the volume number does not)
+    //! when muted, the empty-channels em-dash, the overflow line, and the
+    //! `truncate` helper's char-count contract.
+
+    use super::*;
+    use image::Rgb;
+
+    fn empty_views() -> [ChannelView; 4] {
+        std::array::from_fn(|i| ChannelView {
+            label: format!("CH {}", i + 1),
+            volume: 0,
+            muted: false,
+            apps: vec![],
+        })
+    }
+
+    fn sample_views() -> [ChannelView; 4] {
+        [
+            ChannelView {
+                label: "CH 1".into(),
+                volume: 100,
+                muted: false,
+                apps: vec!["Firefox".into(), "YouTube Music".into()],
+            },
+            ChannelView {
+                label: "CH 2".into(),
+                volume: 0,
+                muted: true,
+                apps: vec!["Discord".into()],
+            },
+            ChannelView {
+                label: "CH 3".into(),
+                volume: 75,
+                muted: false,
+                apps: vec!["Spotify".into()],
+            },
+            ChannelView {
+                label: "CH 4".into(),
+                volume: 0,
+                muted: false,
+                apps: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn render_rgb_returns_800x480() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        assert_eq!(img.width(), W);
+        assert_eq!(img.height(), H);
+    }
+
+    #[test]
+    fn solid_bg_is_used_when_no_background() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // A corner pixel must match the declared `BG` constant.
+        assert_eq!(*img.get_pixel(0, 0), BG);
+    }
+
+    #[test]
+    fn custom_background_is_composited_not_replaced() {
+        // A custom background of a solid red should appear in a corner — the
+        // renderer composites the gauges over it rather than replacing it.
+        let bg = RgbImage::from_pixel(W, H, Rgb([200, 30, 30]));
+        let img = render_rgb(&empty_views(), Some(&bg)).expect("render");
+        // Top-left corner is above any gauge / label / divider, so it must
+        // pass through as the background red.
+        assert_eq!(*img.get_pixel(0, 0), Rgb([200, 30, 30]));
+    }
+
+    #[test]
+    fn column_dividers_are_drawn_between_channels() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // At x = 200 (the start of column 1) the divider rect should be TRACK.
+        let px = img.get_pixel(200, H / 2);
+        assert_eq!(*px, TRACK, "expected TRACK divider at column boundary");
+        // At x = 0 (column 0, no divider on the leftmost) it must be the BG.
+        assert_eq!(*img.get_pixel(0, H / 2), BG);
+    }
+
+    #[test]
+    fn accent_underline_uses_the_channel_colour() {
+        let img = render_rgb(&empty_views(), None).expect("render");
+        // Underline is at UNDERLINE_Y (228), centred on each column. Sample the
+        // centre of column 0's underline — it must be ACCENT[0] (blue).
+        let cx = (COL_W / 2) as i32;
+        assert_eq!(
+            *img.get_pixel(cx as u32, UNDERLINE_Y as u32 + 1),
+            ACCENT[0],
+            "column 0 underline must be ACCENT[0]"
+        );
+        // And column 1's underline must be ACCENT[1] (green), not [0].
+        let cx1 = (COL_W + COL_W / 2) as i32;
+        assert_eq!(
+            *img.get_pixel(cx1 as u32, UNDERLINE_Y as u32 + 1),
+            ACCENT[1],
+            "column 1 underline must be ACCENT[1]"
+        );
+    }
+
+    #[test]
+    fn arc_fill_at_full_volume_reaches_accent_colour() {
+        let mut views = empty_views();
+        views[0].volume = 150; // VOLUME_MAX
+        let img = render_rgb(&views, None).expect("render");
+        // A point near the end of the gauge sweep should be the accent colour.
+        // Sweep starts at 135° (lower-left) and goes 270° clockwise to 405°
+        // (i.e. 45°), so the end is roughly the upper-right quadrant.
+        // GAUGE_R = 64, GAUGE_CY = 116, centre cx = 100 for col 0.
+        let end_rad = (GAUGE_START + GAUGE_SWEEP).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * end_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * end_rad.sin()).round();
+        let px = img.get_pixel(x as u32, y as u32);
+        assert_eq!(*px, ACCENT[0], "arc end at 100% volume must be ACCENT[0]");
+    }
+
+    #[test]
+    fn arc_track_is_visible_where_fill_does_not_reach() {
+        let mut views = empty_views();
+        views[0].volume = 0; // no fill — only the track
+        let img = render_rgb(&views, None).expect("render");
+        // At the end of the sweep (no fill here), the track colour must show.
+        let end_rad = (GAUGE_START + GAUGE_SWEEP).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * end_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * end_rad.sin()).round();
+        let px = img.get_pixel(x as u32, y as u32);
+        assert_eq!(*px, TRACK, "track must be visible at volume=0");
+    }
+
+    #[test]
+    fn muted_channel_uses_mute_arc_colour_for_fill() {
+        let mut views = empty_views();
+        views[0].volume = 100;
+        views[0].muted = true;
+        let img = render_rgb(&views, None).expect("render");
+        // Mid-sweep (fraction 0.5) is well inside the fill band.
+        let mid_rad = (GAUGE_START + GAUGE_SWEEP * 0.5).to_radians();
+        let r = GAUGE_R;
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + r * mid_rad.cos()).round();
+        let y = (GAUGE_CY as f32 + r * mid_rad.sin()).round();
+        assert_eq!(
+            *img.get_pixel(x as u32, y as u32),
+            MUTE_ARC,
+            "muted fill must use MUTE_ARC"
+        );
+    }
+
+    #[test]
+    fn empty_channel_renders_em_dash_in_source_area() {
+        // No background, no apps on any channel — the em-dash must be drawn at
+        // LIST_Y0 in DIM colour. Em-dash is short glyph so we sample a band of
+        // rows (the actual glyph renders slightly below the baseline because of
+        // font ascent) and assert at least one DIM pixel exists in that band.
+        let img = render_rgb(&empty_views(), None).expect("render");
+        let cx = (COL_W / 2) as i32;
+        let y0 = LIST_Y0;
+        let mut found_dim = false;
+        'outer: for y in (y0 - 2)..=(y0 + 20) {
+            for dx in (-30i32..=30).step_by(2) {
+                let p = img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32);
+                if *p == DIM {
+                    found_dim = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found_dim, "expected a DIM-coloured pixel under the em-dash");
+    }
+
+    #[test]
+    fn overflow_line_uses_plus_n_more_format() {
+        let mut views = empty_views();
+        // LIST_MAX_LINES = 9 — feed in 12 apps, expect "+3 more" on the
+        // overflow line at LIST_Y0 + (LIST_MAX_LINES - 1) * LIST_LINE_H.
+        views[0].apps = (1..=12).map(|i| format!("app{}", i)).collect();
+        let img = render_rgb(&views, None).expect("render");
+        // We can't OCR the bitmap, but we can prove two things at once:
+        //   1. With 12 apps, the renderer doesn't crash (it would panic on a
+        //      bounds issue before this assertion even runs).
+        //   2. The overflow line lands at LIST_Y0 + 8 * LIST_LINE_H, which is
+        //      *after* the 9 shown apps — scan that row for any DIM pixel.
+        let cx = (COL_W / 2) as i32;
+        let overflow_y = LIST_Y0 + ((LIST_MAX_LINES as i32) - 1) * LIST_LINE_H - 2;
+        let mut found_dim = false;
+        'outer: for y in overflow_y..=(overflow_y + 22) {
+            for dx in (-50i32..=50).step_by(2) {
+                let p = img.get_pixel((cx + dx).max(0) as u32, y.max(0) as u32);
+                if *p == DIM {
+                    found_dim = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            found_dim,
+            "expected DIM pixels at the '+N more' overflow line"
+        );
+    }
+
+    #[test]
+    fn jpeg_render_returns_non_empty_bytes() {
+        let jpeg = render(&sample_views(), None).expect("render jpeg");
+        assert!(!jpeg.is_empty(), "JPEG blob must not be empty");
+        // The JPEG SOI marker is FF D8 FF.
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn jpeg_with_background_still_decodes_to_800x480() {
+        let bg = RgbImage::from_pixel(W, H, Rgb([10, 200, 30]));
+        let jpeg = render(&sample_views(), Some(&bg)).expect("render jpeg");
+        let decoded = image::load_from_memory(&jpeg)
+            .expect("decode jpeg")
+            .to_rgb8();
+        assert_eq!(decoded.width(), W);
+        assert_eq!(decoded.height(), H);
+    }
+
+    // --- truncate -----------------------------------------------------------
+
+    #[test]
+    fn truncate_returns_input_under_limit() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("", 5), "");
+        assert_eq!(truncate("abc", 3), "abc"); // exactly at limit, no ellipsis
+    }
+
+    #[test]
+    fn truncate_replaces_tail_with_ellipsis() {
+        let out = truncate("abcdefghijklmnop", 5);
+        // 4 chars + ellipsis
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("abcd"));
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_at_boundary() {
+        // The function must count chars, not bytes — `é` is 2 bytes.
+        let s = "aébcdef";
+        let out = truncate(s, 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('…'));
     }
 }

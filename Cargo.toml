@@ -19,6 +19,9 @@ ab_glyph = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "beacn-mix"
 path = "src/main.rs"

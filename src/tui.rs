@@ -10,7 +10,7 @@
 
 use crate::mix::Channel;
 use crate::pw;
-use crate::state::{Bindings, DisplayConfig, Levels};
+use crate::state::{Bindings, DisplayConfig, Levels, OutputConfig};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -35,11 +35,13 @@ const ACCENT: [Color; 4] = [
     Color::Rgb(190, 130, 240), // violet
 ];
 
-/// Settings rows: dim-after, full brightness, dim brightness, 4 channel names,
-/// then the "reload background" action button.
-const SETTINGS_FIELDS: usize = 8;
-/// Index of the first channel-name row (rows below this are numeric).
-const NAME_FIELD_BASE: usize = 3;
+/// Settings rows: dim-after, full brightness, dim brightness, output device,
+/// 4 channel names, then the "reload background" action button.
+const SETTINGS_FIELDS: usize = 9;
+/// Index of the output-device row (cycled with ←/→).
+const OUTPUT_FIELD: usize = 3;
+/// Index of the first channel-name row.
+const NAME_FIELD_BASE: usize = 4;
 /// Index of the "reload background" action row (just past the 4 name rows).
 const REFRESH_FIELD: usize = NAME_FIELD_BASE + 4;
 /// Max length of a custom channel name.
@@ -222,6 +224,10 @@ struct App {
     routing: ListState,
     settings: ListState,
     display: DisplayConfig,
+    /// Chosen output device the channels feed (None = system default).
+    output: OutputConfig,
+    /// Available output devices, for the output-device cycle row.
+    outputs: Vec<pw::Output>,
     /// True while typing into the selected channel-name field.
     editing: bool,
     status: String,
@@ -261,6 +267,8 @@ pub fn run() -> Result<()> {
         routing,
         settings,
         display: DisplayConfig::load().unwrap_or_default(),
+        output: OutputConfig::load().unwrap_or_default(),
+        outputs: pw::list_outputs().unwrap_or_default(),
         editing: false,
         status: String::new(),
     };
@@ -373,8 +381,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
     let is_name = (NAME_FIELD_BASE..REFRESH_FIELD).contains(&field);
     let is_button = field == REFRESH_FIELD;
-    // Numeric (adjustable) rows are everything that isn't a name or the button.
-    let is_numeric = !is_name && !is_button;
+    let is_output = field == OUTPUT_FIELD;
+    // Numeric (adjustable) rows are everything that isn't a name, the output
+    // cycle, or the button.
+    let is_numeric = !is_name && !is_button && !is_output;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -394,6 +404,9 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         {
             save_adjust(app, field, 1)
         }
+        // Output device cycles through the available sinks with ←/→.
+        KeyCode::Left | KeyCode::Char('h') if is_output => cycle_output(app, -1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter if is_output => cycle_output(app, 1),
         KeyCode::Enter if is_name => {
             app.editing = true;
             app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
@@ -453,6 +466,35 @@ fn save_adjust(app: &mut App, field: usize, dir: i64) {
     adjust(&mut app.display, field, dir);
     app.status = match app.display.save() {
         Ok(()) => "Saved — the daemon applies it within ~1s.".to_string(),
+        Err(e) => format!("Save failed: {e}"),
+    };
+}
+
+/// Step the chosen output device by `dir` (wrapping) and persist it; the daemon
+/// repoints all four channel loopbacks onto it within ~1s.
+fn cycle_output(app: &mut App, dir: i64) {
+    if app.outputs.is_empty() {
+        app.status = "No output devices found.".to_string();
+        return;
+    }
+    let n = app.outputs.len() as i64;
+    let cur = app
+        .output
+        .sink
+        .as_deref()
+        .and_then(|s| app.outputs.iter().position(|o| o.name == s));
+    let next = match cur {
+        Some(i) => (i as i64 + dir).rem_euclid(n) as usize,
+        // Nothing chosen yet: ← lands on the last device, → on the first.
+        None if dir < 0 => (n - 1) as usize,
+        None => 0,
+    };
+    app.output.sink = Some(app.outputs[next].name.clone());
+    app.status = match app.output.save() {
+        Ok(()) => format!(
+            "Output → {} (daemon switches within ~1s).",
+            app.outputs[next].label()
+        ),
         Err(e) => format!("Save failed: {e}"),
     };
 }
@@ -561,10 +603,21 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
 
     let d = &app.display;
     let sel = app.settings.selected().unwrap_or(0);
+    // Friendly label for the currently-chosen output device.
+    let output_label = match &app.output.sink {
+        Some(name) => app
+            .outputs
+            .iter()
+            .find(|o| &o.name == name)
+            .map(|o| o.label().to_string())
+            .unwrap_or_else(|| format!("{name} (not present)")),
+        None => "(system default)".to_string(),
+    };
     let mut items: Vec<ListItem> = vec![
         field_item("Dim after", format!("{} min", d.dim_after_secs / 60)),
         field_item("Full brightness", format!("{}%", d.full_brightness)),
         field_item("Dim brightness", format!("{}%", d.dim_brightness)),
+        field_item("Output device", format!("◂ {output_label} ▸")),
     ];
     for i in 0..4 {
         let name = &d.channel_names[i];
@@ -598,6 +651,8 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         app.status.clone()
     } else if sel == REFRESH_FIELD {
         "↑/↓ select · Enter reload background · Tab routing · q quit".to_string()
+    } else if sel == OUTPUT_FIELD {
+        "↑/↓ select · ←/→ change output device · Tab routing · q quit".to_string()
     } else if sel >= NAME_FIELD_BASE {
         "↑/↓ select · Enter rename · Tab routing · q quit".to_string()
     } else {

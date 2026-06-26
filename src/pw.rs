@@ -83,16 +83,7 @@ pub fn ensure_channels(output: &str) -> Result<Vec<u32>> {
         created.push(parse_module_id(&null_id)?);
 
         // Pipe that sink's monitor out to the real device so it's audible.
-        let loop_id = pactl(&[
-            "load-module",
-            "module-loopback",
-            &format!("source={name}.monitor"),
-            &format!("sink={output}"),
-            "source_dont_move=true",
-            "sink_dont_move=true",
-            "latency_msec=20",
-        ])?;
-        created.push(parse_module_id(&loop_id)?);
+        created.push(load_loopback(ch, output)?);
 
         log::info!(
             "Created channel {} -> sink '{name}' -> '{output}'",
@@ -101,6 +92,24 @@ pub fn ensure_channels(output: &str) -> Result<Vec<u32>> {
     }
 
     Ok(created)
+}
+
+/// Load a `module-loopback` piping a channel's monitor out to `output`, returning
+/// the new module id. The `*_dont_move=true` flags pin it so PipeWire's own
+/// stream-follows-default logic can't drag it off `output` — switching the output
+/// is therefore done by reloading this module (see [`set_output`]), not moving it.
+fn load_loopback(ch: Channel, output: &str) -> Result<u32> {
+    let name = sink_name(ch);
+    let id = pactl(&[
+        "load-module",
+        "module-loopback",
+        &format!("source={name}.monitor"),
+        &format!("sink={output}"),
+        "source_dont_move=true",
+        "sink_dont_move=true",
+        "latency_msec=20",
+    ])?;
+    parse_module_id(&id)
 }
 
 fn parse_module_id(s: &str) -> Result<u32> {
@@ -162,6 +171,160 @@ pub fn channel_of_sink(sink: &str) -> Option<Channel> {
 pub fn unload_module(id: u32) -> Result<()> {
     pactl(&["unload-module", &id.to_string()])?;
     Ok(())
+}
+
+/// A real output device (sink) the channels can be routed to — i.e. any sink
+/// except our own `BeacnChN` null-sinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// The node name pactl uses to address it.
+    pub name: String,
+    /// Friendly description for display (e.g. "Klipsch R-15PM Analog Stereo").
+    pub description: String,
+}
+
+impl Output {
+    pub fn label(&self) -> &str {
+        if self.description.is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
+}
+
+/// Enumerate real output devices (sinks), excluding our own channel null-sinks.
+pub fn list_outputs() -> Result<Vec<Output>> {
+    Ok(parse_outputs(&pactl(&["list", "sinks"])?))
+}
+
+/// Pure parser for `pactl list sinks`, dropping our `BeacnChN` channel sinks so
+/// only genuine output devices remain. Split out for unit testing.
+fn parse_outputs(text: &str) -> Vec<Output> {
+    let mut outputs = Vec::new();
+    let mut name = String::new();
+    let mut description = String::new();
+
+    let flush = |outputs: &mut Vec<Output>, name: &mut String, desc: &mut String| {
+        let n = std::mem::take(name);
+        let d = std::mem::take(desc);
+        if !n.is_empty() && !n.starts_with("BeacnCh") {
+            outputs.push(Output {
+                name: n,
+                description: d,
+            });
+        }
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Sink #") {
+            flush(&mut outputs, &mut name, &mut description);
+        } else if let Some(v) = trimmed.strip_prefix("Name: ") {
+            if name.is_empty() {
+                name = v.trim().to_owned();
+            }
+        } else if let Some(v) = trimmed.strip_prefix("Description: ") {
+            if description.is_empty() {
+                description = v.trim().to_owned();
+            }
+        }
+    }
+    flush(&mut outputs, &mut name, &mut description);
+    outputs
+}
+
+/// One of our channel loopbacks, as discovered from `pactl list modules`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Loopback {
+    module_id: u32,
+    channel: Channel,
+    /// The sink this loopback currently feeds.
+    sink: String,
+}
+
+/// Discover our four channel loopbacks (module id + which channel + current sink)
+/// by parsing `pactl list modules`. Used to read the current output and to know
+/// which modules to reload when switching it.
+fn channel_loopbacks() -> Result<Vec<Loopback>> {
+    Ok(parse_loopbacks(&pactl(&["list", "modules"])?))
+}
+
+/// Pure parser for `pactl list modules`: pick out `module-loopback`s whose source
+/// is one of our `BeacnChN.monitor`s, with the sink they feed. Split for testing.
+fn parse_loopbacks(text: &str) -> Vec<Loopback> {
+    let mut loops = Vec::new();
+    let mut id: Option<u32> = None;
+    let mut is_loopback = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Module #") {
+            id = rest.trim().parse().ok();
+            is_loopback = false;
+        } else if trimmed == "Name: module-loopback" {
+            is_loopback = true;
+        } else if let Some(arg) = trimmed.strip_prefix("Argument: ") {
+            if !is_loopback {
+                continue;
+            }
+            // Argument is space-separated `key=value` tokens; we want the source
+            // (to identify the channel) and the sink it currently feeds.
+            let source = arg_token(arg, "source=");
+            let sink = arg_token(arg, "sink=");
+            if let (Some(source), Some(sink), Some(mid)) = (source, sink, id) {
+                if let Some(channel) = source.strip_suffix(".monitor").and_then(channel_of_sink) {
+                    loops.push(Loopback {
+                        module_id: mid,
+                        channel,
+                        sink,
+                    });
+                }
+            }
+        }
+    }
+    loops
+}
+
+/// Value of a `key=value` token within a space-separated argument string.
+/// `key` must include the trailing `=` (e.g. `"sink="`).
+fn arg_token(arg: &str, key: &str) -> Option<String> {
+    arg.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(key))
+        .map(str::to_owned)
+}
+
+/// The sink our channels currently feed (read from the channel loopbacks), if any.
+/// All four normally share one output, so the first is representative.
+pub fn current_output() -> Option<String> {
+    channel_loopbacks().ok()?.first().map(|l| l.sink.clone())
+}
+
+/// Repoint every channel loopback at `output`, so all Beacn-routed audio switches
+/// to that device. Reloads each loopback module (the `dont_move` pins rule out a
+/// plain move) and returns the `(old_id, new_id)` swaps so the caller can keep the
+/// persisted `Modules` list in sync (`old_id` is 0 when a channel had no loopback).
+pub fn set_output(output: &str) -> Result<Vec<(u32, u32)>> {
+    let loops = channel_loopbacks()?;
+    let mut swaps = Vec::new();
+    for ch in Channel::ALL {
+        match loops.iter().find(|l| l.channel == ch) {
+            Some(lb) if lb.sink == output => {} // already feeding the target
+            Some(lb) => {
+                unload_module(lb.module_id)?;
+                let new_id = load_loopback(ch, output)?;
+                swaps.push((lb.module_id, new_id));
+            }
+            None => {
+                let new_id = load_loopback(ch, output)?;
+                swaps.push((0, new_id));
+            }
+        }
+    }
+    if !swaps.is_empty() {
+        log::info!("Switched channel output -> '{output}'");
+    }
+    Ok(swaps)
 }
 
 /// A currently-playing application stream.
@@ -392,5 +555,77 @@ Source #77
             description: String::new(),
         };
         assert_eq!(s.label(), "alsa_input.thing");
+    }
+
+    // A real mic, the active output, and one of our channel sinks (filtered out).
+    const SINKS: &str = r#"
+Sink #57
+        State: SUSPENDED
+        Name: alsa_output.usb-Generic_USB_Audio-00.HiFi__Headphones__sink
+        Description: USB Audio Front Headphones
+Sink #60
+        State: RUNNING
+        Name: alsa_output.usb-NAE_Klipsch_R-15PM-01.analog-stereo
+        Description: Klipsch R-15PM Analog Stereo
+Sink #1950
+        State: RUNNING
+        Name: BeacnCh1
+        Description: Beacn_Channel_1
+Sink #59892
+        State: SUSPENDED
+        Name: alsa_output.usb-GuangZhou_FiiO_Electronics_Co._Ltd_FiiO_K3-00.iec958-stereo
+        Description: FiiO K3 Digital Stereo (IEC958)
+"#;
+
+    #[test]
+    fn parse_outputs_lists_real_sinks_and_drops_channel_sinks() {
+        let got = parse_outputs(SINKS);
+        let names: Vec<&str> = got.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "the BeacnCh1 channel sink must be dropped");
+        assert!(names.iter().all(|n| !n.starts_with("BeacnCh")));
+        assert!(got
+            .iter()
+            .any(|o| o.label() == "Klipsch R-15PM Analog Stereo"));
+        assert!(got
+            .iter()
+            .any(|o| o.label() == "FiiO K3 Digital Stereo (IEC958)"));
+    }
+
+    // Two of our channel loopbacks plus an unrelated module that must be ignored.
+    const MODULES: &str = r#"
+Module #100
+        Name: module-loopback
+        Argument: source=BeacnCh1.monitor sink=alsa_output.klipsch source_dont_move=true sink_dont_move=true latency_msec=20
+Module #101
+        Name: module-null-sink
+        Argument: sink_name=BeacnCh1 sink_properties=device.description=Beacn_Channel_1
+Module #102
+        Name: module-loopback
+        Argument: source=BeacnCh3.monitor sink=alsa_output.klipsch source_dont_move=true sink_dont_move=true latency_msec=20
+Module #103
+        Name: module-loopback
+        Argument: source=SomeOther.monitor sink=alsa_output.klipsch
+"#;
+
+    #[test]
+    fn parse_loopbacks_finds_channel_loopbacks_only() {
+        let got = parse_loopbacks(MODULES);
+        assert_eq!(got.len(), 2, "only our two BeacnCh loopbacks should match");
+        assert_eq!(got[0].module_id, 100);
+        assert_eq!(got[0].channel, Channel(0));
+        assert_eq!(got[0].sink, "alsa_output.klipsch");
+        assert_eq!(got[1].module_id, 102);
+        assert_eq!(got[1].channel, Channel(2));
+    }
+
+    #[test]
+    fn arg_token_extracts_keyed_values() {
+        let arg = "source=BeacnCh2.monitor sink=alsa_output.foo latency_msec=20";
+        assert_eq!(
+            arg_token(arg, "source="),
+            Some("BeacnCh2.monitor".to_string())
+        );
+        assert_eq!(arg_token(arg, "sink="), Some("alsa_output.foo".to_string()));
+        assert_eq!(arg_token(arg, "missing="), None);
     }
 }

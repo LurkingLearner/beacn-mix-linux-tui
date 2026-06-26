@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use image::RgbImage;
 use mix::{channel_for_button, channel_for_dial, Channel, Mix};
 use screen::ChannelView;
-use state::{Bindings, DisplayConfig, Levels, Modules};
+use state::{Bindings, DisplayConfig, Levels, Modules, OutputConfig};
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -131,7 +131,7 @@ fn cmd_preview(path: &str) -> Result<()> {
 
 /// Ensure the four channel sinks exist; persist any modules we loaded.
 fn cmd_setup() -> Result<usize> {
-    let output = pw::default_sink().context("getting default output sink")?;
+    let output = configured_output()?;
     let new_ids = pw::ensure_channels(&output)?;
     if !new_ids.is_empty() {
         let mut modules = Modules::load()?;
@@ -139,6 +139,72 @@ fn cmd_setup() -> Result<usize> {
         modules.save()?;
     }
     Ok(new_ids.len())
+}
+
+/// The output sink the channels should feed: the one saved in `OutputConfig` when
+/// it's set and currently present, else the system default. (Only affects the
+/// *initial* loopback creation — switching an existing setup goes via
+/// [`apply_output`].)
+fn configured_output() -> Result<String> {
+    if let Some(sink) = OutputConfig::load().unwrap_or_default().sink {
+        if pw::list_outputs()
+            .map(|outs| outs.iter().any(|o| o.name == sink))
+            .unwrap_or(false)
+        {
+            return Ok(sink);
+        }
+        log::warn!("configured output '{sink}' not present; using system default");
+    }
+    pw::default_sink().context("getting default output sink")
+}
+
+/// Reconcile the channel loopbacks with the desired output: if a sink is chosen
+/// (and present) and the channels aren't already feeding it, reload the loopbacks
+/// onto it and keep the persisted `Modules` list in sync. A `None` config or a
+/// missing device is a no-op (the channels keep their current output).
+fn apply_output(cfg: &OutputConfig) {
+    let Some(target) = cfg.sink.as_deref() else {
+        return;
+    };
+    if pw::current_output().as_deref() == Some(target) {
+        return; // already feeding the chosen device
+    }
+    match pw::list_outputs() {
+        Ok(outs) if outs.iter().any(|o| o.name == target) => {}
+        Ok(_) => {
+            log::warn!("chosen output '{target}' not present; keeping current output");
+            return;
+        }
+        Err(e) => {
+            log::warn!("listing outputs failed: {e}");
+            return;
+        }
+    }
+    match pw::set_output(target) {
+        Ok(swaps) => {
+            if let Err(e) = persist_module_swaps(&swaps) {
+                log::warn!("persisting output module swap failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("switching output failed: {e}"),
+    }
+}
+
+/// Update the persisted `Modules` list after [`pw::set_output`] reloaded loopbacks:
+/// drop the old loopback ids (0 = none) and record the new ones, so `teardown`
+/// still removes exactly the modules that are live.
+fn persist_module_swaps(swaps: &[(u32, u32)]) -> Result<()> {
+    if swaps.is_empty() {
+        return Ok(());
+    }
+    let mut modules = Modules::load()?;
+    for (old, new) in swaps {
+        if *old != 0 {
+            modules.ids.retain(|id| id != old);
+        }
+        modules.ids.push(*new);
+    }
+    modules.save()
 }
 
 fn cmd_teardown() -> Result<()> {
@@ -201,6 +267,12 @@ fn cmd_assign() -> Result<()> {
 
 fn cmd_run() -> Result<()> {
     cmd_setup()?;
+
+    // Output device the channels feed (Klipsch vs. DAC, etc.). Reconcile once at
+    // startup in case the saved choice differs from what the loopbacks feed (e.g.
+    // they were left pointing elsewhere by a previous session), then re-read live.
+    let mut output_cfg = OutputConfig::load().unwrap_or_default();
+    apply_output(&output_cfg);
 
     // Per-channel mic bindings: when a channel has one, its encoder rides that
     // capture device's gain/mute instead of the output sink. Re-read live below.
@@ -436,6 +508,13 @@ fn cmd_run() -> Result<()> {
                             }
                         }
                     }
+                    // Output-device switch from the TUI Settings page.
+                    let ocfg = OutputConfig::load().unwrap_or_default();
+                    if ocfg != output_cfg {
+                        output_cfg = ocfg;
+                        apply_output(&output_cfg);
+                    }
+
                     let cfg = DisplayConfig::load().unwrap_or_default();
                     if cfg != display {
                         // A bumped generation is the TUI's "reload background" signal.

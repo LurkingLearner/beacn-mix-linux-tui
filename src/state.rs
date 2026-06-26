@@ -43,6 +43,10 @@ impl Paths {
         self.config_dir.join("display.json")
     }
 
+    pub fn output(&self) -> PathBuf {
+        self.config_dir.join("output.json")
+    }
+
     /// First existing `background.{png,jpg,jpeg}` under `config_dir`, if any.
     pub fn background(&self) -> Option<PathBuf> {
         ["background.png", "background.jpg", "background.jpeg"]
@@ -130,6 +134,10 @@ fn levels_path() -> PathBuf {
 
 fn display_path() -> PathBuf {
     current_paths().display()
+}
+
+fn output_path() -> PathBuf {
+    current_paths().output()
 }
 
 fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &PathBuf) -> Result<T> {
@@ -307,6 +315,27 @@ impl DisplayConfig {
         } else {
             name.clone()
         }
+    }
+}
+
+/// Which real output device the channels feed. Written by the TUI Settings page,
+/// reconciled live by `run` (it reloads the channel loopbacks onto this sink when
+/// it differs from what they currently feed). `None` = follow the system default
+/// output, which is the original behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// The chosen sink node name, or `None` to use the default output.
+    #[serde(default)]
+    pub sink: Option<String>,
+}
+
+impl OutputConfig {
+    pub fn load() -> Result<Self> {
+        load_json(&output_path())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        save_json(&output_path(), self)
     }
 }
 
@@ -541,6 +570,26 @@ mod tests {
             }
         });
         drop(dir); // keep tempdir alive through the load above
+    }
+
+    #[test]
+    fn output_config_defaults_to_none_and_roundtrips() {
+        let p = temp_paths();
+        with_paths(p.clone(), || {
+            // Missing file → default (follow system default output).
+            assert_eq!(OutputConfig::load().expect("load default").sink, None);
+            OutputConfig {
+                sink: Some("alsa_output.fiio".into()),
+            }
+            .save()
+            .expect("save");
+        });
+        with_paths(p, || {
+            assert_eq!(
+                OutputConfig::load().expect("reload").sink.as_deref(),
+                Some("alsa_output.fiio")
+            );
+        });
     }
 
     #[test]

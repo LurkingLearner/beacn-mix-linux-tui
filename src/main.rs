@@ -78,28 +78,24 @@ fn main() -> Result<()> {
 fn cmd_preview(path: &str) -> Result<()> {
     let views: [ChannelView; 4] = [
         ChannelView {
-            name: "Firefox".into(),
-            volume: 75,
+            volume: 100,
             muted: false,
-            extra: 1,
+            apps: vec!["Firefox".into(), "YouTube Music".into()],
         },
         ChannelView {
-            name: "Discord".into(),
-            volume: 110,
-            muted: false,
-            extra: 0,
-        },
-        ChannelView {
-            name: "Spotify".into(),
-            volume: 45,
+            volume: 90,
             muted: true,
-            extra: 0,
+            apps: vec!["Discord".into(), "Zoom".into()],
         },
         ChannelView {
-            name: "—".into(),
+            volume: 52,
+            muted: false,
+            apps: vec!["Spotify".into()],
+        },
+        ChannelView {
             volume: 75,
             muted: false,
-            extra: 0,
+            apps: vec![],
         },
     ];
     let jpeg = screen::render(&views)?;
@@ -202,8 +198,8 @@ fn cmd_run() -> Result<()> {
     for _ in mix.events.try_iter() {}
 
     mix.init_display();
-    let mut labels = channel_labels();
-    refresh_screen(&mix, &labels, &volumes, &mutes);
+    let mut sources = channel_sources();
+    refresh_screen(&mix, &sources, &volumes, &mutes);
 
     log::info!(
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
@@ -265,7 +261,7 @@ fn cmd_run() -> Result<()> {
             },
             recv(ui) -> _ => {
                 if dirty {
-                    refresh_screen(&mix, &labels, &volumes, &mutes);
+                    refresh_screen(&mix, &sources, &volumes, &mutes);
                     dirty = false;
                 }
                 if levels_dirty {
@@ -276,9 +272,9 @@ fn cmd_run() -> Result<()> {
                 // Re-poll routing roughly once a second so panel labels track
                 // assign/unassign done in the TUI without needing a knob turn.
                 if ticks.is_multiple_of(7) {
-                    let next = channel_labels();
-                    if next != labels {
-                        labels = next;
+                    let next = channel_sources();
+                    if next != sources {
+                        sources = next;
                         dirty = true;
                     }
                 }
@@ -294,13 +290,12 @@ fn cmd_run() -> Result<()> {
     Ok(())
 }
 
-/// Build the four channel tiles from precomputed labels + current volumes/mutes.
-fn refresh_screen(mix: &Mix, labels: &[(String, usize); 4], volumes: &[u32; 4], mutes: &[bool; 4]) {
+/// Build the four channel tiles from precomputed sources + current volumes/mutes.
+fn refresh_screen(mix: &Mix, sources: &[Vec<String>; 4], volumes: &[u32; 4], mutes: &[bool; 4]) {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
-        name: labels[i].0.clone(),
         volume: volumes[i],
         muted: mutes[i],
-        extra: labels[i].1,
+        apps: sources[i].clone(),
     });
     match screen::render(&views) {
         Ok(jpeg) => {
@@ -312,27 +307,25 @@ fn refresh_screen(mix: &Mix, labels: &[(String, usize); 4], volumes: &[u32; 4], 
     }
 }
 
-/// Per-channel panel label: (first app's name, count of *additional* apps on the
-/// channel). Derived from **live routing** — what's actually playing on each
-/// channel's sink — so two instances of the same app (e.g. two Firefox windows)
-/// each show on their own channel instead of colliding on one binding key. Falls
-/// back to a bound-but-idle app name when nothing is playing there.
-fn channel_labels() -> [(String, usize); 4] {
+/// Per-channel source list for the panel, derived from **live routing** — the
+/// apps actually playing on each channel's sink — so two instances of the same
+/// app (e.g. two Firefox windows) each show on their own channel instead of
+/// colliding on one binding key. Falls back to the bound-but-idle app names when
+/// nothing is playing on a channel.
+fn channel_sources() -> [Vec<String>; 4] {
     let streams = pw::app_streams().unwrap_or_default();
     let bindings = Bindings::load().unwrap_or_default();
     std::array::from_fn(|i| {
         let ch = Channel(i);
-        let live: Vec<&str> = streams
+        let live: Vec<String> = streams
             .iter()
             .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
-            .map(panel_label)
+            .map(|s| panel_label(s).to_string())
             .collect();
-        if let Some((first, rest)) = live.split_first() {
-            return (first.to_string(), rest.len());
-        }
-        match bindings.apps_for_channel(ch).split_first() {
-            Some((first, rest)) => (first.clone(), rest.len()),
-            None => ("—".to_string(), 0),
+        if live.is_empty() {
+            bindings.apps_for_channel(ch)
+        } else {
+            live
         }
     })
 }

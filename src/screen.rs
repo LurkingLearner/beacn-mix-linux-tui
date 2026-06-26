@@ -1,11 +1,15 @@
-//! Render the 800×480 panel image: four channel tiles, each showing the bound
-//! app name, a level bar, the volume %, and a mute indicator. The Mix decodes
-//! JPEG on-device, so we hand `beacn-lib`'s `set_image` a JPEG blob.
+//! Render the 800×480 panel: four channel tiles, each a Beacn-style arc gauge
+//! (volume integer in the centre), the channel label with an accent underline,
+//! and the list of source apps grouped on that channel. The Mix decodes JPEG
+//! on-device, so we hand `beacn-lib`'s `set_image` a JPEG blob.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, Result};
 use image::{Rgb, RgbImage};
-use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
+use imageproc::drawing::{
+    draw_filled_circle_mut, draw_filled_rect_mut, draw_polygon_mut, draw_text_mut,
+};
+use imageproc::point::Point;
 use imageproc::rect::Rect;
 
 const W: u32 = 800;
@@ -18,6 +22,7 @@ const FG: Rgb<u8> = Rgb([235, 238, 245]);
 const DIM: Rgb<u8> = Rgb([120, 126, 140]);
 const TRACK: Rgb<u8> = Rgb([40, 44, 54]);
 const MUTE: Rgb<u8> = Rgb([224, 80, 80]);
+const MUTE_ARC: Rgb<u8> = Rgb([120, 62, 66]);
 
 /// Per-channel accent colour (left→right).
 const ACCENT: [Rgb<u8>; 4] = [
@@ -27,15 +32,29 @@ const ACCENT: [Rgb<u8>; 4] = [
     Rgb([190, 130, 240]), // violet
 ];
 
+// Gauge geometry: a ~270° arc, open at the bottom (gap centred on straight down).
+const GAUGE_CY: i32 = 116;
+const GAUGE_R: f32 = 64.0;
+const GAUGE_TH: i32 = 14;
+const GAUGE_START: f32 = 135.0;
+const GAUGE_SWEEP: f32 = 270.0;
+const VOLUME_MAX: f32 = 150.0;
+
+// Label + source list below the gauge.
+const LABEL_Y: i32 = 196;
+const UNDERLINE_Y: i32 = 228;
+const LIST_Y0: i32 = 244;
+const LIST_LINE_H: i32 = 23;
+const LIST_MAX_LINES: usize = 9;
+
 static FONT_BYTES: &[u8] = include_bytes!("../assets/Rubik-SemiBold.ttf");
 
 /// What to show for one channel.
 pub struct ChannelView {
-    pub name: String,
     pub volume: u32,
     pub muted: bool,
-    /// How many *additional* apps share this channel beyond `name` (0 = just one).
-    pub extra: usize,
+    /// Source apps grouped on this channel (top-to-bottom). Empty = unbound.
+    pub apps: Vec<String>,
 }
 
 /// Render the four tiles into a JPEG suitable for `set_image(0, 0, ..)`.
@@ -46,85 +65,33 @@ pub fn render(views: &[ChannelView; 4]) -> Result<Vec<u8>> {
     for (i, view) in views.iter().enumerate() {
         let x0 = i as u32 * COL_W;
         let accent = ACCENT[i];
-        let cx = x0 + COL_W / 2;
+        let cx = (x0 + COL_W / 2) as i32;
 
         // Column divider.
         if i > 0 {
             draw_filled_rect_mut(&mut img, Rect::at(x0 as i32, 0).of_size(2, H), TRACK);
         }
 
-        // Header: CH n
+        draw_gauge(&mut img, &font, cx, view, accent);
+
+        // Channel label + accent underline.
         centered(
             &mut img,
             &font,
             cx,
-            18,
-            30.0,
+            LABEL_Y,
+            23.0,
             accent,
             &format!("CH {}", i + 1),
         );
-
-        // App name (truncated to fit the column).
-        let name = truncate(&view.name, 13);
-        centered(&mut img, &font, cx, 58, 26.0, FG, &name);
-
-        // When several apps share this channel, note how many more there are.
-        if view.extra > 0 {
-            centered(
-                &mut img,
-                &font,
-                cx,
-                90,
-                18.0,
-                accent,
-                &format!("+{} more", view.extra),
-            );
-        }
-
-        // Vertical level bar.
-        let bar_w = 56;
-        let bar_h = 250u32;
-        let bar_x = (cx - bar_w / 2) as i32;
-        let bar_y = 120i32;
+        let uw = 66u32;
         draw_filled_rect_mut(
             &mut img,
-            Rect::at(bar_x, bar_y).of_size(bar_w, bar_h),
-            TRACK,
+            Rect::at(cx - (uw / 2) as i32, UNDERLINE_Y).of_size(uw, 4),
+            accent,
         );
 
-        let frac = (view.volume as f32 / 150.0).clamp(0.0, 1.0);
-        let fill_h = (bar_h as f32 * frac) as u32;
-        if fill_h > 0 {
-            let fill_color = if view.muted {
-                Rgb([70, 50, 54])
-            } else {
-                accent
-            };
-            let fill_y = bar_y + (bar_h - fill_h) as i32;
-            draw_filled_rect_mut(
-                &mut img,
-                Rect::at(bar_x, fill_y).of_size(bar_w, fill_h),
-                fill_color,
-            );
-        }
-        // 100% reference tick.
-        let tick_y = bar_y + (bar_h as f32 * (1.0 - 100.0 / 150.0)) as i32;
-        draw_filled_rect_mut(&mut img, Rect::at(bar_x, tick_y).of_size(bar_w, 2), DIM);
-
-        // Volume % and mute state.
-        let pct_color = if view.muted { DIM } else { FG };
-        centered(
-            &mut img,
-            &font,
-            cx,
-            388,
-            32.0,
-            pct_color,
-            &format!("{}%", view.volume),
-        );
-        if view.muted {
-            centered(&mut img, &font, cx, 430, 26.0, MUTE, "MUTE");
-        }
+        draw_sources(&mut img, &font, cx, &view.apps);
     }
 
     let mut buf = Vec::new();
@@ -133,11 +100,164 @@ pub fn render(views: &[ChannelView; 4]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The arc gauge: dim track, accent fill to the current level, a 100% headroom
+/// pip, and either the volume integer or a mute icon in the centre.
+fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, accent: Rgb<u8>) {
+    let end = GAUGE_START + GAUGE_SWEEP;
+
+    // Track (full sweep).
+    draw_arc(
+        img,
+        (cx, GAUGE_CY),
+        GAUGE_R,
+        GAUGE_TH,
+        GAUGE_START,
+        end,
+        TRACK,
+    );
+
+    // Fill (0..level).
+    let frac = (view.volume as f32 / VOLUME_MAX).clamp(0.0, 1.0);
+    if frac > 0.01 {
+        let fill_color = if view.muted { MUTE_ARC } else { accent };
+        let fill_end = GAUGE_START + frac * GAUGE_SWEEP;
+        draw_arc(
+            img,
+            (cx, GAUGE_CY),
+            GAUGE_R,
+            GAUGE_TH,
+            GAUGE_START,
+            fill_end,
+            fill_color,
+        );
+    }
+
+    // 100% headroom pip, just outside the band.
+    let pip = (GAUGE_START + (100.0 / VOLUME_MAX) * GAUGE_SWEEP).to_radians();
+    let pr = GAUGE_R + GAUGE_TH as f32 / 2.0 + 5.0;
+    draw_filled_circle_mut(
+        img,
+        (
+            (cx as f32 + pr * pip.cos()).round() as i32,
+            (GAUGE_CY as f32 + pr * pip.sin()).round() as i32,
+        ),
+        2,
+        DIM,
+    );
+
+    // Centre: mute icon, or the volume integer.
+    if view.muted {
+        draw_mute_icon(img, cx, GAUGE_CY);
+    } else {
+        let s = format!("{}", view.volume);
+        let px = 46.0;
+        centered(
+            img,
+            font,
+            cx,
+            (GAUGE_CY as f32 - px * 0.62) as i32,
+            px,
+            FG,
+            &s,
+        );
+    }
+}
+
+/// Draw a thick arc by stepping filled circles along its centreline (rounded caps).
+fn draw_arc(
+    img: &mut RgbImage,
+    center: (i32, i32),
+    r: f32,
+    th: i32,
+    start_deg: f32,
+    end_deg: f32,
+    color: Rgb<u8>,
+) {
+    let (cx, cy) = center;
+    let span = (end_deg - start_deg).abs();
+    let steps = (span * 1.5).ceil().max(1.0) as i32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let rad = (start_deg + (end_deg - start_deg) * t).to_radians();
+        let x = (cx as f32 + r * rad.cos()).round() as i32;
+        let y = (cy as f32 + r * rad.sin()).round() as i32;
+        draw_filled_circle_mut(img, (x, y), th / 2, color);
+    }
+}
+
+/// A small muted-speaker glyph (grey speaker + red slash) for the gauge centre.
+fn draw_mute_icon(img: &mut RgbImage, cx: i32, cy: i32) {
+    // Speaker back (rectangle) + cone (trapezoid widening right).
+    draw_filled_rect_mut(img, Rect::at(cx - 16, cy - 7).of_size(8, 14), DIM);
+    let cone = [
+        Point::new(cx - 9, cy - 7),
+        Point::new(cx + 3, cy - 16),
+        Point::new(cx + 3, cy + 16),
+        Point::new(cx - 9, cy + 7),
+    ];
+    draw_polygon_mut(img, &cone, DIM);
+    // Slash with a dark casing so the red reads over the grey speaker.
+    let (x0, y0, x1, y1) = (
+        (cx - 18) as f32,
+        (cy - 16) as f32,
+        (cx + 16) as f32,
+        (cy + 16) as f32,
+    );
+    stroke(img, x0, y0, x1, y1, 4, BG);
+    stroke(img, x0, y0, x1, y1, 2, MUTE);
+}
+
+/// Draw a thick line by stepping filled circles along it.
+fn stroke(img: &mut RgbImage, x0: f32, y0: f32, x1: f32, y1: f32, radius: i32, color: Rgb<u8>) {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let steps = len as i32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        draw_filled_circle_mut(
+            img,
+            ((x0 + dx * t) as i32, (y0 + dy * t) as i32),
+            radius,
+            color,
+        );
+    }
+}
+
+/// The small source-app list under the label, with a "+N more" overflow line.
+fn draw_sources(img: &mut RgbImage, font: &FontRef, cx: i32, apps: &[String]) {
+    if apps.is_empty() {
+        centered(img, font, cx, LIST_Y0, 17.0, DIM, "—");
+        return;
+    }
+    let mut y = LIST_Y0;
+    let overflow = apps.len() > LIST_MAX_LINES;
+    let shown = if overflow {
+        LIST_MAX_LINES - 1
+    } else {
+        apps.len()
+    };
+    for app in apps.iter().take(shown) {
+        centered(img, font, cx, y, 17.0, DIM, &truncate(app, 20));
+        y += LIST_LINE_H;
+    }
+    if overflow {
+        centered(
+            img,
+            font,
+            cx,
+            y,
+            17.0,
+            DIM,
+            &format!("+{} more", apps.len() - shown),
+        );
+    }
+}
+
 /// Draw text horizontally centred on `cx`, top at `y`.
 fn centered(
     img: &mut RgbImage,
     font: &FontRef,
-    cx: u32,
+    cx: i32,
     y: i32,
     px: f32,
     color: Rgb<u8>,

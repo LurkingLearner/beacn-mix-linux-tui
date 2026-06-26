@@ -2,6 +2,7 @@
 name = "beacn-mix-linux"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Use a Beacn Mix as a PipeWire channel mixer: bind app audio to the four channels and ride levels with the hardware encoders."
 
 [dependencies]

@@ -1,5 +1,7 @@
 # beacn-mix-linux
 
+![Panel preview](assets/preview.jpg)
+
 Use a **Beacn Mix** as a PipeWire channel mixer on Linux: bind a running app's
 audio to one of the four channels and ride its level with the matching hardware
 encoder. Encoder **press** toggles mute.
@@ -103,3 +105,12 @@ Working: per-channel volume + mute from the encoders, runtime assignment + a
 routing TUI, the 800×480 gauge panel with optional custom background, and
 idle-resume screen wake. Not yet done (see `beacn-lib`'s `set_button_colour`):
 lighting the encoder rings.
+
+## Credits
+
+- The UI font is [Rubik](https://github.com/googlefonts/rubik) by The Rubik
+  Project Authors, bundled under the [SIL Open Font License 1.1](assets/Rubik-OFL.txt).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

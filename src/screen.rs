@@ -57,6 +57,8 @@ static FONT_BYTES: &[u8] = include_bytes!("../assets/Rubik-SemiBold.ttf");
 
 /// What to show for one channel.
 pub struct ChannelView {
+    /// Channel label (custom name, or "CH n").
+    pub label: String,
     pub volume: u32,
     pub muted: bool,
     /// Source apps grouped on this channel (top-to-bottom). Empty = unbound.
@@ -114,7 +116,7 @@ pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result
             LABEL_Y,
             23.0,
             accent,
-            &format!("CH {}", i + 1),
+            &truncate(&view.label, 14),
         );
         let uw = 66u32;
         draw_filled_rect_mut(

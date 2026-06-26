@@ -89,21 +89,25 @@ fn main() -> Result<()> {
 fn cmd_preview(path: &str) -> Result<()> {
     let views: [ChannelView; 4] = [
         ChannelView {
+            label: "Media".into(),
             volume: 100,
             muted: false,
             apps: vec!["Firefox".into(), "YouTube Music".into()],
         },
         ChannelView {
+            label: "Chat".into(),
             volume: 90,
             muted: true,
             apps: vec!["Discord".into(), "Zoom".into()],
         },
         ChannelView {
+            label: "Music".into(),
             volume: 52,
             muted: false,
             apps: vec!["Spotify".into()],
         },
         ChannelView {
+            label: "CH 4".into(),
             volume: 75,
             muted: false,
             apps: vec![],
@@ -223,7 +227,14 @@ fn cmd_run() -> Result<()> {
     mix.init_display(display.full_brightness);
 
     let mut sources = channel_sources();
-    refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
+    refresh_screen(
+        &mix,
+        &display,
+        &sources,
+        &volumes,
+        &mutes,
+        background.as_ref(),
+    );
 
     log::info!(
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
@@ -304,7 +315,7 @@ fn cmd_run() -> Result<()> {
                 last_tick = now;
 
                 if dirty {
-                    refresh_screen(&mix, &sources, &volumes, &mutes, background.as_ref());
+                    refresh_screen(&mix, &display, &sources, &volumes, &mutes, background.as_ref());
                     dirty = false;
                 }
                 if levels_dirty {
@@ -331,6 +342,7 @@ fn cmd_run() -> Result<()> {
                     if cfg != display {
                         display = cfg;
                         mix.set_brightness(brightness_for(screen, &display));
+                        dirty = true; // names may have changed; redraw the panel
                     }
                 }
 
@@ -370,12 +382,14 @@ fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
 /// Build the four channel tiles from precomputed sources + current volumes/mutes.
 fn refresh_screen(
     mix: &Mix,
+    display: &DisplayConfig,
     sources: &[Vec<String>; 4],
     volumes: &[u32; 4],
     mutes: &[bool; 4],
     background: Option<&RgbImage>,
 ) {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
+        label: display.channel_label(i),
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),

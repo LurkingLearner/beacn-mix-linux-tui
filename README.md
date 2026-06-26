@@ -59,7 +59,9 @@ hardware via `beacn-mix preview`.
 
 Open `beacn-mix tui`, press `Tab` to the **Settings** page, and adjust **Dim after**
 (idle minutes before dimming), **Full brightness**, and **Dim brightness** with
-`←/→`. Changes save to `~/.config/beacn-mix-linux/display.json` and the running daemon
+`←/→`. The same page has a **custom name per channel** (select the row, press `Enter`,
+type, `Enter`/`Esc` when done) — the name shows on the panel and in the TUI instead of
+"CH n". Changes save to `~/.config/beacn-mix-linux/display.json` and the running daemon
 applies them within ~1 s.
 
 ### Custom background

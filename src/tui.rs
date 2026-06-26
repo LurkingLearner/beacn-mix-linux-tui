@@ -35,8 +35,12 @@ const ACCENT: [Color; 4] = [
     Color::Rgb(190, 130, 240), // violet
 ];
 
-/// Number of editable rows on the Settings page.
-const SETTINGS_FIELDS: usize = 3;
+/// Settings rows: dim-after, full brightness, dim brightness, then 4 channel names.
+const SETTINGS_FIELDS: usize = 7;
+/// Index of the first channel-name row (rows below this are numeric).
+const NAME_FIELD_BASE: usize = 3;
+/// Max length of a custom channel name.
+const NAME_MAX: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -169,6 +173,8 @@ struct App {
     routing: ListState,
     settings: ListState,
     display: DisplayConfig,
+    /// True while typing into the selected channel-name field.
+    editing: bool,
     status: String,
 }
 
@@ -206,6 +212,7 @@ pub fn run() -> Result<()> {
         routing,
         settings,
         display: DisplayConfig::load().unwrap_or_default(),
+        editing: false,
         status: String::new(),
     };
 
@@ -227,6 +234,12 @@ pub fn run() -> Result<()> {
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        // While renaming a channel, all keys go to the text field.
+        if app.editing {
+            handle_edit_key(&mut app, key.code);
             continue;
         }
 
@@ -309,6 +322,7 @@ fn handle_routing_key(app: &mut App, code: KeyCode) {
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
+    let is_name = field >= NAME_FIELD_BASE;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -319,9 +333,48 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                 .select(Some((field + 1).min(SETTINGS_FIELDS - 1)));
             app.status.clear();
         }
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => save_adjust(app, field, -1),
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=') => {
+        // Numeric fields adjust with ←/→; name fields are typed (Enter to start).
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') if !is_name => {
+            save_adjust(app, field, -1)
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=')
+            if !is_name =>
+        {
             save_adjust(app, field, 1)
+        }
+        KeyCode::Enter if is_name => {
+            app.editing = true;
+            app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
+        }
+        _ => {}
+    }
+}
+
+/// Text entry into the selected channel-name field.
+fn handle_edit_key(app: &mut App, code: KeyCode) {
+    let Some(i) = app
+        .settings
+        .selected()
+        .and_then(|f| f.checked_sub(NAME_FIELD_BASE))
+    else {
+        app.editing = false;
+        return;
+    };
+    match code {
+        KeyCode::Enter | KeyCode::Esc => {
+            app.editing = false;
+            app.status = "Saved — the daemon applies it within ~1s.".to_string();
+        }
+        KeyCode::Backspace => {
+            app.display.channel_names[i].pop();
+            let _ = app.display.save();
+        }
+        KeyCode::Char(c)
+            if (c.is_ascii_graphic() || c == ' ')
+                && app.display.channel_names[i].chars().count() < NAME_MAX =>
+        {
+            app.display.channel_names[i].push(c);
+            let _ = app.display.save();
         }
         _ => {}
     }
@@ -367,10 +420,16 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
     for (i, col) in cols.iter().enumerate() {
         let ch = Channel(i);
         let vol = app.snap.levels.volumes[i];
-        let title = if app.snap.levels.mutes[i] {
-            format!(" CH{}  {vol}%  MUTE ", ch.human())
+        let name = &app.display.channel_names[i];
+        let label = if name.is_empty() {
+            format!("CH{}", ch.human())
         } else {
-            format!(" CH{}  {vol}% ", ch.human())
+            format!("CH{} {name}", ch.human())
+        };
+        let title = if app.snap.levels.mutes[i] {
+            format!(" {label}  {vol}%  MUTE ")
+        } else {
+            format!(" {label}  {vol}% ")
         };
 
         let mut lines: Vec<Line> = Vec::new();
@@ -419,29 +478,45 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// A "Label            value" row for the settings list.
+fn field_item<'a>(name: &str, value: String) -> ListItem<'a> {
+    ListItem::new(format!("  {name:<18}{value}"))
+}
+
 fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
 
     let d = &app.display;
-    let fields = [
-        ("Dim after", format!("{} min", d.dim_after_secs / 60)),
-        ("Full brightness", format!("{}%", d.full_brightness)),
-        ("Dim brightness", format!("{}%", d.dim_brightness)),
+    let sel = app.settings.selected().unwrap_or(0);
+    let mut items: Vec<ListItem> = vec![
+        field_item("Dim after", format!("{} min", d.dim_after_secs / 60)),
+        field_item("Full brightness", format!("{}%", d.full_brightness)),
+        field_item("Dim brightness", format!("{}%", d.dim_brightness)),
     ];
-    let items: Vec<ListItem> = fields
-        .iter()
-        .map(|(name, val)| ListItem::new(format!("  {name:<18}{val}")))
-        .collect();
+    for i in 0..4 {
+        let name = &d.channel_names[i];
+        let mut val = if name.is_empty() {
+            format!("(CH {})", i + 1)
+        } else {
+            name.clone()
+        };
+        if app.editing && sel == NAME_FIELD_BASE + i {
+            val.push('▏'); // cursor
+        }
+        items.push(field_item(&format!("Channel {} name", i + 1), val));
+    }
     let list = List::new(items)
         .block(Block::bordered().title(" Panel display "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.settings);
 
-    let help = if app.status.is_empty() {
-        "↑/↓ select · ←/→ (or -/+) adjust · Tab routing · q quit".to_string()
-    } else {
+    let help = if !app.status.is_empty() {
         app.status.clone()
+    } else if sel >= NAME_FIELD_BASE {
+        "↑/↓ select · Enter rename · Tab routing · q quit".to_string()
+    } else {
+        "↑/↓ select · ←/→ (or -/+) adjust · Tab routing · q quit".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::styled(help, Style::new().fg(Color::Gray))),

@@ -139,6 +139,9 @@ pub struct DisplayConfig {
     pub full_brightness: u8,
     /// Brightness once dimmed.
     pub dim_brightness: u8,
+    /// Optional custom label per channel; empty falls back to "CH n".
+    #[serde(default)]
+    pub channel_names: [String; 4],
 }
 
 impl Default for DisplayConfig {
@@ -147,6 +150,7 @@ impl Default for DisplayConfig {
             dim_after_secs: 300,
             full_brightness: 80,
             dim_brightness: 12,
+            channel_names: std::array::from_fn(|_| String::new()),
         }
     }
 }
@@ -158,6 +162,16 @@ impl DisplayConfig {
 
     pub fn save(&self) -> Result<()> {
         save_json(&display_path(), self)
+    }
+
+    /// Display label for a channel: the custom name, or "CH n" when unset.
+    pub fn channel_label(&self, i: usize) -> String {
+        let name = &self.channel_names[i];
+        if name.is_empty() {
+            format!("CH {}", i + 1)
+        } else {
+            name.clone()
+        }
     }
 }
 

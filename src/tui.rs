@@ -53,6 +53,37 @@ enum Page {
     Settings,
 }
 
+/// Which region of the Routing page has the keyboard focus. The four channel
+/// panels (which manage *assigned* items) and the Unassigned list sit in one
+/// left-to-right ring: `CH1 · CH2 · CH3 · CH4 · Unassigned`. `←/→` step through
+/// it; `↑/↓` move the selection within the focused region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Channel(usize),
+    Unassigned,
+}
+
+impl Focus {
+    /// Step `dir` (±1) through the five focus positions, wrapping.
+    fn step(self, dir: i64) -> Focus {
+        let cur = match self {
+            Focus::Channel(i) => i as i64,
+            Focus::Unassigned => 4,
+        };
+        match (cur + dir).rem_euclid(5) {
+            4 => Focus::Unassigned,
+            n => Focus::Channel(n as usize),
+        }
+    }
+}
+
+/// One rendered line of the Unassigned list: either a bucket header (skipped
+/// during selection) or a selectable item indexing into `Snapshot::rows`.
+enum UnEntry {
+    Header(&'static str),
+    Item(usize),
+}
+
 /// One manageable entry: a live playback stream, an app that's bound to a
 /// channel but isn't currently playing, or a capture device (mic) that can ride
 /// a channel's gain.
@@ -101,16 +132,12 @@ impl Row {
         }
     }
 
-    /// Row text for the selectable list, prefixed with its current channel.
-    fn display(&self) -> String {
-        let ch = match self.channel() {
-            Some(c) => format!("CH{}", c.human()),
-            None => " — ".to_string(),
-        };
+    /// The friendly display name (no channel prefix): the stream/app label, or
+    /// the mic's description. Used for list rendering and filter matching.
+    fn name(&self) -> &str {
         match self {
-            Row::Live { label, .. } => format!("[{ch}] {label}"),
-            Row::Idle { app, .. } => format!("[{ch}] {app} (idle)"),
-            Row::Mic { label, .. } => format!("[{ch}] {label} (mic)"),
+            Row::Live { label, .. } | Row::Mic { label, .. } => label,
+            Row::Idle { app, .. } => app,
         }
     }
 }
@@ -173,6 +200,81 @@ fn snapshot() -> Snapshot {
     Snapshot { rows, levels }
 }
 
+/// Indices into `snap.rows` of the rows currently assigned to channel `ch`
+/// (live streams on it, idle bound apps, and bound mics), in snapshot order.
+fn channel_rows(snap: &Snapshot, ch: usize) -> Vec<usize> {
+    snap.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.channel() == Some(Channel(ch)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Build the Unassigned list: every row with no channel, bucketed `Apps`
+/// (playback streams) then `Mics` (capture devices), each alphabetical and
+/// narrowed by a case-insensitive substring `filter`. A bucket's header is
+/// omitted when it has no matching items. `Idle` rows are always assigned, so
+/// they never appear here.
+fn unassigned_entries(snap: &Snapshot, filter: &str) -> Vec<UnEntry> {
+    let needle = filter.to_lowercase();
+    let matches = |label: &str| needle.is_empty() || label.to_lowercase().contains(&needle);
+
+    let mut apps: Vec<(String, usize)> = Vec::new();
+    let mut mics: Vec<(String, usize)> = Vec::new();
+    for (i, row) in snap.rows.iter().enumerate() {
+        if row.channel().is_some() {
+            continue;
+        }
+        match row {
+            Row::Live { label, .. } if matches(label) => apps.push((label.clone(), i)),
+            Row::Mic { label, .. } if matches(label) => mics.push((label.clone(), i)),
+            _ => {}
+        }
+    }
+    let by_label =
+        |a: &(String, usize), b: &(String, usize)| a.0.to_lowercase().cmp(&b.0.to_lowercase());
+    apps.sort_by(by_label);
+    mics.sort_by(by_label);
+
+    let mut entries = Vec::new();
+    if !apps.is_empty() {
+        entries.push(UnEntry::Header("Apps"));
+        entries.extend(apps.into_iter().map(|(_, i)| UnEntry::Item(i)));
+    }
+    if !mics.is_empty() {
+        entries.push(UnEntry::Header("Mics"));
+        entries.extend(mics.into_iter().map(|(_, i)| UnEntry::Item(i)));
+    }
+    entries
+}
+
+/// The combined-list index of the next selectable `Item` from `from`, stepping
+/// `dir` (-1/0/+1) and skipping `Header` entries. `dir == 0` snaps a stale or
+/// header selection onto the nearest item; returns `None` when there are no
+/// items.
+fn next_item(entries: &[UnEntry], from: Option<usize>, dir: i64) -> Option<usize> {
+    let items: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, UnEntry::Item(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let last = *items.last()?;
+    match from {
+        None => Some(items[0]),
+        Some(cur) => match items.iter().position(|&i| i == cur) {
+            Some(p) => {
+                let np = (p as i64 + dir).clamp(0, items.len() as i64 - 1) as usize;
+                Some(items[np])
+            }
+            // `cur` landed on a header or fell out of range: snap to the first
+            // item at or after it (else the last item).
+            None => Some(items.into_iter().find(|&i| i >= cur).unwrap_or(last)),
+        },
+    }
+}
+
 /// Bind a row to a channel: move its live stream (if any) and persist the
 /// binding. For a mic there's no graph move — we just persist the binding and the
 /// daemon starts riding that mic's gain on the channel within ~1s.
@@ -221,7 +323,16 @@ fn adjust(cfg: &mut DisplayConfig, field: usize, dir: i64) {
 struct App {
     page: Page,
     snap: Snapshot,
-    routing: ListState,
+    /// Which Routing region has focus (a channel panel or the Unassigned list).
+    focus: Focus,
+    /// Selection within each channel panel (index into that channel's rows).
+    chan_state: [ListState; 4],
+    /// Selection within the Unassigned list (index into its combined entries).
+    unas_state: ListState,
+    /// Live substring filter applied to the Unassigned list.
+    filter: String,
+    /// True while typing into the Unassigned filter.
+    filtering: bool,
     settings: ListState,
     display: DisplayConfig,
     /// Chosen output device the channels feed (None = system default).
@@ -257,14 +368,16 @@ pub fn run() -> Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let mut routing = ListState::default();
-    routing.select(Some(0));
     let mut settings = ListState::default();
     settings.select(Some(0));
     let mut app = App {
         page: Page::Routing,
         snap: snapshot(),
-        routing,
+        focus: Focus::Channel(0),
+        chan_state: std::array::from_fn(|_| ListState::default()),
+        unas_state: ListState::default(),
+        filter: String::new(),
+        filtering: false,
         settings,
         display: DisplayConfig::load().unwrap_or_default(),
         output: OutputConfig::load().unwrap_or_default(),
@@ -275,14 +388,16 @@ pub fn run() -> Result<()> {
 
     loop {
         // Keep selections within bounds as streams come and go.
-        clamp_selection(&mut app.routing, app.snap.rows.len());
+        clamp_channels(&mut app);
+        normalize_unas(&mut app);
         clamp_selection(&mut app.settings, SETTINGS_FIELDS);
 
         terminal.draw(|f| draw(f, &mut app))?;
 
-        // Block briefly for input; on timeout, refresh the routing snapshot.
+        // Block briefly for input; on timeout, refresh the routing snapshot —
+        // but not mid-filter, so the list doesn't shift under the cursor.
         if !event::poll(Duration::from_millis(750))? {
-            if app.page == Page::Routing {
+            if app.page == Page::Routing && !app.filtering {
                 app.snap = snapshot();
             }
             continue;
@@ -297,6 +412,12 @@ pub fn run() -> Result<()> {
         // While renaming a channel, all keys go to the text field.
         if app.editing {
             handle_edit_key(&mut app, key.code);
+            continue;
+        }
+
+        // While filtering, all keys go to the Unassigned filter field.
+        if app.filtering {
+            handle_filter_key(&mut app, key.code);
             continue;
         }
 
@@ -331,29 +452,93 @@ fn clamp_selection(state: &mut ListState, len: usize) {
     }
 }
 
+/// Index into `snap.rows` of the row selected in the currently-focused region,
+/// or `None` (empty pane, or a header is "selected").
+fn selected_row_index(app: &App) -> Option<usize> {
+    match app.focus {
+        Focus::Channel(c) => {
+            let rows = channel_rows(&app.snap, c);
+            app.chan_state[c]
+                .selected()
+                .and_then(|s| rows.get(s).copied())
+        }
+        Focus::Unassigned => {
+            let entries = unassigned_entries(&app.snap, &app.filter);
+            match app.unas_state.selected().and_then(|s| entries.get(s)) {
+                Some(UnEntry::Item(i)) => Some(*i),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Move the selection within the focused region by `dir` (±1), skipping headers
+/// in the Unassigned list and clamping within a channel's rows.
+fn move_selection(app: &mut App, dir: i64) {
+    match app.focus {
+        Focus::Channel(c) => {
+            let len = channel_rows(&app.snap, c).len();
+            if len == 0 {
+                app.chan_state[c].select(None);
+            } else {
+                let cur = app.chan_state[c].selected().unwrap_or(0) as i64;
+                let next = (cur + dir).clamp(0, len as i64 - 1) as usize;
+                app.chan_state[c].select(Some(next));
+            }
+        }
+        Focus::Unassigned => {
+            let entries = unassigned_entries(&app.snap, &app.filter);
+            let next = next_item(&entries, app.unas_state.selected(), dir);
+            app.unas_state.select(next);
+        }
+    }
+}
+
+/// Re-point the channel selections within their (possibly changed) row counts.
+fn clamp_channels(app: &mut App) {
+    for c in 0..4 {
+        let len = channel_rows(&app.snap, c).len();
+        if len == 0 {
+            app.chan_state[c].select(None);
+        } else {
+            let cur = app.chan_state[c].selected().unwrap_or(0).min(len - 1);
+            app.chan_state[c].select(Some(cur));
+        }
+    }
+}
+
+/// Re-point the Unassigned selection onto a valid item after the list changes
+/// (snapshot refresh, filter edit, assign/unassign).
+fn normalize_unas(app: &mut App) {
+    let entries = unassigned_entries(&app.snap, &app.filter);
+    let sel = next_item(&entries, app.unas_state.selected(), 0);
+    app.unas_state.select(sel);
+}
+
 fn handle_routing_key(app: &mut App, code: KeyCode) {
-    let selected = app
-        .routing
-        .selected()
-        .and_then(|i| app.snap.rows.get(i).cloned());
     match code {
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.focus = app.focus.step(-1);
+            app.status.clear();
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            app.focus = app.focus.step(1);
+            app.status.clear();
+        }
         KeyCode::Up | KeyCode::Char('k') => {
-            let cur = app.routing.selected().unwrap_or(0);
-            app.routing.select(Some(cur.saturating_sub(1)));
+            move_selection(app, -1);
             app.status.clear();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if !app.snap.rows.is_empty() {
-                let cur = app.routing.selected().unwrap_or(0);
-                app.routing
-                    .select(Some((cur + 1).min(app.snap.rows.len() - 1)));
-            }
+            move_selection(app, 1);
             app.status.clear();
         }
+        // From the Unassigned pane, 1-4 assigns the selected source; from a
+        // channel pane, it *moves* the selected item to another channel.
         KeyCode::Char(c @ '1'..='4') => {
-            if let Some(row) = &selected {
-                let ch = Channel(c as usize - '1' as usize);
-                app.status = match assign(row, ch) {
+            let ch = Channel(c as usize - '1' as usize);
+            if let Some(row) = selected_row_index(app).map(|i| app.snap.rows[i].clone()) {
+                app.status = match assign(&row, ch) {
                     Ok(()) => format!("Assigned {} → CH{}", row.app(), ch.human()),
                     Err(e) => format!("Assign failed: {e}"),
                 };
@@ -361,17 +546,46 @@ fn handle_routing_key(app: &mut App, code: KeyCode) {
             app.snap = snapshot();
         }
         KeyCode::Char('u') => {
-            if let Some(row) = &selected {
-                app.status = match unassign(row) {
+            if let Some(row) = selected_row_index(app).map(|i| app.snap.rows[i].clone()) {
+                app.status = match unassign(&row) {
                     Ok(()) => format!("Unassigned {}", row.app()),
                     Err(e) => format!("Unassign failed: {e}"),
                 };
             }
             app.snap = snapshot();
         }
+        KeyCode::Char('/') => {
+            app.focus = Focus::Unassigned;
+            app.filtering = true;
+            app.status = "Filter: type to narrow · Enter keep · Esc clear".to_string();
+        }
         KeyCode::Char('r') => {
             app.snap = snapshot();
             app.status.clear();
+        }
+        _ => {}
+    }
+}
+
+/// Text entry into the Unassigned filter (active while `app.filtering`).
+fn handle_filter_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Enter => {
+            app.filtering = false;
+            app.status = "Filter applied · Esc clears it".to_string();
+        }
+        KeyCode::Esc => {
+            app.filter.clear();
+            app.filtering = false;
+            app.status.clear();
+        }
+        KeyCode::Backspace => {
+            app.filter.pop();
+            normalize_unas(app);
+        }
+        KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' => {
+            app.filter.push(c);
+            normalize_unas(app);
         }
         _ => {}
     }
@@ -526,7 +740,7 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
     ])
     .split(area);
 
-    // Four channel panels, each listing the apps routed to it.
+    // Four channel panels, each a selectable list of the items routed to it.
     let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(chunks[0]);
     for (i, col) in cols.iter().enumerate() {
         let ch = Channel(i);
@@ -543,49 +757,91 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &mut App) {
             format!(" {label}  {vol}% ")
         };
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut items: Vec<ListItem> = Vec::new();
         for row in &app.snap.rows {
             if row.channel() == Some(ch) {
-                match row {
-                    Row::Live { label, .. } => lines.push(Line::from(label.clone())),
-                    Row::Idle { app, .. } => lines.push(Line::styled(
+                items.push(match row {
+                    Row::Live { label, .. } => ListItem::new(label.clone()),
+                    Row::Idle { app, .. } => ListItem::new(Line::styled(
                         format!("{app} (idle)"),
                         Style::new().fg(Color::DarkGray),
                     )),
-                    Row::Mic { label, .. } => lines.push(Line::styled(
+                    Row::Mic { label, .. } => ListItem::new(Line::styled(
                         format!("mic: {label}"),
                         Style::new().fg(ACCENT[i]),
                     )),
-                }
+                });
             }
         }
-        if lines.is_empty() {
-            lines.push(Line::styled("—", Style::new().fg(Color::DarkGray)));
+        let empty = items.is_empty();
+        if empty {
+            items.push(ListItem::new(Line::styled(
+                "—",
+                Style::new().fg(Color::DarkGray),
+            )));
         }
 
-        let block = Block::bordered()
-            .title(title)
-            .border_style(Style::new().fg(ACCENT[i]));
-        f.render_widget(Paragraph::new(lines).block(block), *col);
+        let focused = app.focus == Focus::Channel(i);
+        let border_style = if focused {
+            Style::new().fg(ACCENT[i]).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(ACCENT[i]).add_modifier(Modifier::DIM)
+        };
+        let mut list =
+            List::new(items).block(Block::bordered().title(title).border_style(border_style));
+        if focused && !empty {
+            list = list
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("▶ ");
+        }
+        f.render_stateful_widget(list, *col, &mut app.chan_state[i]);
     }
 
-    // The selectable list of all streams + idle bound apps.
-    let items: Vec<ListItem> = app
-        .snap
-        .rows
+    // The Unassigned list: bucketed Apps / Mics, narrowed by the filter.
+    let entries = unassigned_entries(&app.snap, &app.filter);
+    let items: Vec<ListItem> = entries
         .iter()
-        .map(|r| ListItem::new(r.display()))
+        .map(|e| match e {
+            UnEntry::Header(h) => ListItem::new(Line::styled(
+                (*h).to_string(),
+                Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            )),
+            UnEntry::Item(idx) => {
+                let row = &app.snap.rows[*idx];
+                match row {
+                    Row::Mic { label, .. } => ListItem::new(format!("  mic: {label}")),
+                    _ => ListItem::new(format!("  {}", row.name())),
+                }
+            }
+        })
         .collect();
-    let list = List::new(items)
-        .block(Block::bordered().title(" Streams & mics — select, then 1-4 to assign "))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, chunks[1], &mut app.routing);
-
-    let help = if app.status.is_empty() {
-        "↑/↓ select · 1-4 assign · u unassign · r refresh · Tab settings · q quit".to_string()
+    let title = if app.filtering || !app.filter.is_empty() {
+        let cursor = if app.filtering { "▏" } else { "" };
+        format!(" Unassigned  filter: {}{} ", app.filter, cursor)
     } else {
+        " Unassigned — select, then 1-4 to assign ".to_string()
+    };
+    let focused = app.focus == Focus::Unassigned;
+    let border_style = if focused {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::DIM)
+    };
+    let mut list =
+        List::new(items).block(Block::bordered().title(title).border_style(border_style));
+    if focused {
+        list = list
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▶ ");
+    }
+    f.render_stateful_widget(list, chunks[1], &mut app.unas_state);
+
+    let help = if !app.status.is_empty() {
         app.status.clone()
+    } else if app.filtering {
+        "type to filter · Enter keep · Esc clear".to_string()
+    } else {
+        "←/→ pane · ↑/↓ select · 1-4 assign/move · u unassign · / filter · r refresh · Tab settings · q quit".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::styled(help, Style::new().fg(Color::Gray))),
@@ -662,4 +918,108 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(Line::styled(help, Style::new().fg(Color::Gray))),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Cover the pure list-partitioning logic that decides what shows up in the
+    //! Unassigned pane and in what order — no PipeWire or terminal needed.
+
+    use super::*;
+
+    fn snap(rows: Vec<Row>) -> Snapshot {
+        Snapshot {
+            rows,
+            levels: Levels::default(),
+        }
+    }
+
+    fn live(app: &str, channel: Option<Channel>) -> Row {
+        Row::Live {
+            index: 0,
+            app: app.to_string(),
+            label: app.to_string(),
+            channel,
+        }
+    }
+
+    fn mic(label: &str, channel: Option<Channel>) -> Row {
+        Row::Mic {
+            name: format!("node.{label}"),
+            label: label.to_string(),
+            channel,
+        }
+    }
+
+    /// Render the entries to a readable form: headers as `# Name`, items as the
+    /// row's display name.
+    fn labels(entries: &[UnEntry], rows: &[Row]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match e {
+                UnEntry::Header(h) => format!("# {h}"),
+                UnEntry::Item(i) => rows[*i].name().to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn excludes_assigned_rows_and_buckets_apps_then_mics() {
+        let s = snap(vec![
+            live("Spotify", None),
+            live("Firefox", Some(Channel(0))), // assigned → excluded
+            Row::Idle {
+                app: "Discord".into(),
+                channel: Channel(1),
+            }, // idle is always assigned → excluded
+            mic("Webcam", None),
+            mic("Yeti", Some(Channel(2))), // assigned → excluded
+            live("Chrome", None),
+        ]);
+        // Apps before Mics, each alphabetical; assigned/idle rows absent.
+        assert_eq!(
+            labels(&unassigned_entries(&s, ""), &s.rows),
+            vec!["# Apps", "Chrome", "Spotify", "# Mics", "Webcam"]
+        );
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_and_drops_empty_group_headers() {
+        let s = snap(vec![
+            live("Spotify", None),
+            live("Chrome", None),
+            mic("Webcam", None),
+        ]);
+        // "CH" matches only Chrome → Apps header, no Mics header.
+        assert_eq!(
+            labels(&unassigned_entries(&s, "CH"), &s.rows),
+            vec!["# Apps", "Chrome"]
+        );
+        // "web" matches only the mic → Mics header, no Apps header.
+        assert_eq!(
+            labels(&unassigned_entries(&s, "web"), &s.rows),
+            vec!["# Mics", "Webcam"]
+        );
+        // No matches → empty list.
+        assert!(unassigned_entries(&s, "zzz").is_empty());
+    }
+
+    #[test]
+    fn next_item_skips_headers_and_clamps() {
+        let s = snap(vec![
+            live("Spotify", None),
+            live("Chrome", None),
+            mic("Webcam", None),
+        ]);
+        let e = unassigned_entries(&s, "");
+        // Entries: [#Apps, Chrome, Spotify, #Mics, Webcam] at indices 0..=4.
+        // No selection → first item (index 1, "Chrome").
+        assert_eq!(next_item(&e, None, 1), Some(1));
+        // From the last app item, stepping down skips the Mics header onto Webcam.
+        assert_eq!(next_item(&e, Some(2), 1), Some(4));
+        // Stepping up from the first item clamps in place.
+        assert_eq!(next_item(&e, Some(1), -1), Some(1));
+        // A stale selection on a header snaps to the next item.
+        assert_eq!(next_item(&e, Some(3), 0), Some(4));
+    }
 }

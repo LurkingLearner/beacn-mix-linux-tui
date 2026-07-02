@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// True for the image extensions we accept as panel backdrops.
+fn is_image_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+}
+
 fn base_dir(env: &str, fallback: &str) -> PathBuf {
     if let Ok(dir) = std::env::var(env) {
         if !dir.is_empty() {
@@ -47,12 +53,31 @@ impl Paths {
         self.config_dir.join("output.json")
     }
 
-    /// First existing `background.{png,jpg,jpeg}` under `config_dir`, if any.
-    pub fn background(&self) -> Option<PathBuf> {
-        ["background.png", "background.jpg", "background.jpeg"]
-            .into_iter()
-            .map(|name| self.config_dir.join(name))
-            .find(|p| p.exists())
+    /// Directory of candidate backdrop images. Drop any number of
+    /// `*.{png,jpg,jpeg}` here and cycle between them from the TUI.
+    pub fn backgrounds_dir(&self) -> PathBuf {
+        self.config_dir.join("backgrounds")
+    }
+
+    /// Path to a named image inside [`backgrounds_dir`] (not checked to exist).
+    pub fn background_named(&self, name: &str) -> PathBuf {
+        self.backgrounds_dir().join(name)
+    }
+
+    /// Image file names found in [`backgrounds_dir`], case-insensitively sorted.
+    /// Empty (rather than an error) when the directory is missing or unreadable.
+    pub fn list_backgrounds(&self) -> Vec<String> {
+        let mut names: Vec<String> = match std::fs::read_dir(self.backgrounds_dir()) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| is_image_name(n))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort_by_key(|n| n.to_lowercase());
+        names
     }
 
     pub fn levels(&self) -> PathBuf {
@@ -118,10 +143,18 @@ fn bindings_path() -> PathBuf {
     current_paths().bindings()
 }
 
-/// First existing `background.{png,jpg,jpeg}` in the config dir, if any. Drop an
-/// image there to use it as the panel backdrop (solid colour is used otherwise).
-pub fn background_path() -> Option<PathBuf> {
-    current_paths().background()
+/// Image file names available under the config `backgrounds/` dir, sorted.
+/// Drop any number of images there and cycle between them from the TUI.
+pub fn list_backgrounds() -> Vec<String> {
+    current_paths().list_backgrounds()
+}
+
+/// Resolve the backdrop a [`DisplayConfig`] selects: the chosen file under
+/// `backgrounds/` if it's set *and* still present, else `None` (solid colour).
+pub fn background_path_for(cfg: &DisplayConfig) -> Option<PathBuf> {
+    let name = cfg.background_file.as_deref()?;
+    let p = current_paths().background_named(name);
+    p.exists().then_some(p)
 }
 
 fn modules_path() -> PathBuf {
@@ -278,10 +311,14 @@ pub struct DisplayConfig {
     /// Optional custom label per channel; empty falls back to "CH n".
     #[serde(default)]
     pub channel_names: [String; 4],
+    /// Chosen backdrop image: a file name under the config `backgrounds/` dir,
+    /// or `None` for the solid colour. Cycled with ←/→ on the TUI Settings page.
+    #[serde(default)]
+    pub background_file: Option<String>,
     /// Bumped by the TUI to ask the daemon to reload the backdrop image from
     /// disk (the daemon loads it once at startup, so this is the on-demand
-    /// "refresh background" signal). The value itself is meaningless — only a
-    /// change matters.
+    /// "refresh background" signal — e.g. after overwriting the chosen file in
+    /// place). The value itself is meaningless — only a change matters.
     #[serde(default)]
     pub background_generation: u64,
 }
@@ -293,6 +330,7 @@ impl Default for DisplayConfig {
             full_brightness: 80,
             dim_brightness: 12,
             channel_names: std::array::from_fn(|_| String::new()),
+            background_file: None,
             background_generation: 0,
         }
     }
@@ -536,6 +574,7 @@ mod tests {
             full_brightness: 100,
             dim_brightness: 5,
             channel_names: std::array::from_fn(|i| format!("name{}", i)),
+            background_file: Some("sunset.png".into()),
             background_generation: 42,
         };
         with_paths(p.clone(), || original.save().expect("save"));
@@ -565,6 +604,7 @@ mod tests {
             assert_eq!(d.full_brightness, 90);
             assert_eq!(d.dim_brightness, 20);
             assert_eq!(d.background_generation, 0);
+            assert_eq!(d.background_file, None);
             for n in &d.channel_names {
                 assert!(n.is_empty());
             }
@@ -616,36 +656,48 @@ mod tests {
     }
 
     #[test]
-    fn background_path_picks_first_existing_extension() {
+    fn list_backgrounds_filters_and_sorts_images() {
         let (dir, p) = make_paths();
-        // No file → None.
+        // No backgrounds/ dir → empty, not an error.
         with_paths(p.clone(), || {
-            assert_eq!(background_path(), None);
+            assert!(list_backgrounds().is_empty());
         });
 
-        // Drop a .png → resolves.
-        std::fs::write(p.config_dir.join("background.png"), b"fake").unwrap();
-        with_paths(p.clone(), || {
-            assert_eq!(background_path(), Some(p.config_dir.join("background.png")));
-        });
+        let bg = p.backgrounds_dir();
+        std::fs::create_dir_all(&bg).unwrap();
+        std::fs::write(bg.join("Zebra.PNG"), b"fake").unwrap(); // mixed-case ext
+        std::fs::write(bg.join("aurora.jpg"), b"fake").unwrap();
+        std::fs::write(bg.join("notes.txt"), b"fake").unwrap(); // non-image, ignored
+        std::fs::create_dir_all(bg.join("subdir")).unwrap(); // dir, ignored
 
-        // Drop a .jpg — should still resolve to .png (the function checks
-        // .png first, so first-existing wins).
-        std::fs::write(p.config_dir.join("background.jpg"), b"fake").unwrap();
         with_paths(p.clone(), || {
-            assert_eq!(
-                background_path(),
-                Some(p.config_dir.join("background.png")),
-                "background.png should win when both exist"
-            );
+            // Case-insensitively sorted, non-images and subdirs dropped.
+            assert_eq!(list_backgrounds(), vec!["aurora.jpg", "Zebra.PNG"]);
         });
+        drop(dir);
+    }
 
-        // Remove .png, keep .jpg → resolves to .jpg.
-        std::fs::remove_file(p.config_dir.join("background.png")).unwrap();
+    #[test]
+    fn background_path_for_resolves_only_present_files() {
+        let (dir, p) = make_paths();
+        let bg = p.backgrounds_dir();
+        std::fs::create_dir_all(&bg).unwrap();
+        std::fs::write(bg.join("sunset.png"), b"fake").unwrap();
+
         with_paths(p.clone(), || {
-            assert_eq!(background_path(), Some(p.config_dir.join("background.jpg")));
+            // None selected → no path.
+            let mut cfg = DisplayConfig::default();
+            assert_eq!(background_path_for(&cfg), None);
+
+            // A present file → its full path under backgrounds/.
+            cfg.background_file = Some("sunset.png".into());
+            assert_eq!(background_path_for(&cfg), Some(bg.join("sunset.png")));
+
+            // A selected-but-missing file → None (falls back to solid colour).
+            cfg.background_file = Some("gone.png".into());
+            assert_eq!(background_path_for(&cfg), None);
         });
-        drop(dir); // keep tempdir alive until end of test
+        drop(dir);
     }
 
     #[test]

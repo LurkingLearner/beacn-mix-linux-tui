@@ -36,14 +36,14 @@ const ACCENT: [Color; 4] = [
 ];
 
 /// Settings rows: dim-after, full brightness, dim brightness, output device,
-/// 4 channel names, then the "reload background" action button.
+/// 4 channel names, then the background-image row.
 const SETTINGS_FIELDS: usize = 9;
 /// Index of the output-device row (cycled with ←/→).
 const OUTPUT_FIELD: usize = 3;
 /// Index of the first channel-name row.
 const NAME_FIELD_BASE: usize = 4;
-/// Index of the "reload background" action row (just past the 4 name rows).
-const REFRESH_FIELD: usize = NAME_FIELD_BASE + 4;
+/// Index of the background-image row (cycle files with ←/→, Enter to reload).
+const BACKGROUND_FIELD: usize = NAME_FIELD_BASE + 4;
 /// Max length of a custom channel name.
 const NAME_MAX: usize = 16;
 
@@ -339,6 +339,9 @@ struct App {
     output: OutputConfig,
     /// Available output devices, for the output-device cycle row.
     outputs: Vec<pw::Output>,
+    /// Image file names under the config `backgrounds/` dir, for the background
+    /// cycle row. Refreshed live so newly-dropped files appear.
+    backgrounds: Vec<String>,
     /// True while typing into the selected channel-name field.
     editing: bool,
     status: String,
@@ -382,6 +385,7 @@ pub fn run() -> Result<()> {
         display: DisplayConfig::load().unwrap_or_default(),
         output: OutputConfig::load().unwrap_or_default(),
         outputs: pw::list_outputs().unwrap_or_default(),
+        backgrounds: crate::state::list_backgrounds(),
         editing: false,
         status: String::new(),
     };
@@ -399,6 +403,9 @@ pub fn run() -> Result<()> {
         if !event::poll(Duration::from_millis(750))? {
             if app.page == Page::Routing && !app.filtering {
                 app.snap = snapshot();
+            } else if app.page == Page::Settings {
+                // Pick up images dropped into backgrounds/ while the TUI is open.
+                app.backgrounds = crate::state::list_backgrounds();
             }
             continue;
         }
@@ -593,12 +600,12 @@ fn handle_filter_key(app: &mut App, code: KeyCode) {
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
-    let is_name = (NAME_FIELD_BASE..REFRESH_FIELD).contains(&field);
-    let is_button = field == REFRESH_FIELD;
+    let is_name = (NAME_FIELD_BASE..BACKGROUND_FIELD).contains(&field);
+    let is_background = field == BACKGROUND_FIELD;
     let is_output = field == OUTPUT_FIELD;
     // Numeric (adjustable) rows are everything that isn't a name, the output
-    // cycle, or the button.
-    let is_numeric = !is_name && !is_button && !is_output;
+    // cycle, or the background row.
+    let is_numeric = !is_name && !is_background && !is_output;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -621,26 +628,57 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         // Output device cycles through the available sinks with ←/→.
         KeyCode::Left | KeyCode::Char('h') if is_output => cycle_output(app, -1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter if is_output => cycle_output(app, 1),
+        // Background image cycles through backgrounds/ with ←/→; Enter reloads
+        // the chosen file from disk (for an overwrite-in-place refresh).
+        KeyCode::Left | KeyCode::Char('h') if is_background => cycle_background(app, -1),
+        KeyCode::Right | KeyCode::Char('l') if is_background => cycle_background(app, 1),
+        KeyCode::Enter if is_background => request_background_reload(app),
         KeyCode::Enter if is_name => {
             app.editing = true;
             app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
         }
-        KeyCode::Enter if is_button => request_background_reload(app),
         _ => {}
     }
 }
 
-/// Signal the daemon to reload the backdrop image: bump the generation counter and
-/// save `display.json`. The daemon notices the change within ~1s and re-reads the
-/// `background.{png,jpg,jpeg}` from the config dir.
+/// Step the chosen backdrop through `[off] + backgrounds/` by `dir` (wrapping)
+/// and persist it; the daemon swaps the panel image within ~1s. `off` (index 0)
+/// is the solid colour; files follow in sorted order.
+fn cycle_background(app: &mut App, dir: i64) {
+    let files = &app.backgrounds;
+    let n = files.len() as i64 + 1; // +1 for the "off" entry at index 0
+    let cur = match &app.display.background_file {
+        None => 0,
+        Some(name) => files
+            .iter()
+            .position(|f| f == name)
+            .map(|i| i as i64 + 1)
+            .unwrap_or(0),
+    };
+    let next = (cur + dir).rem_euclid(n);
+    app.display.background_file = if next == 0 {
+        None
+    } else {
+        files.get((next - 1) as usize).cloned()
+    };
+    app.status = match app.display.save() {
+        Ok(()) => {
+            let label = app.display.background_file.as_deref().unwrap_or("(off)");
+            format!("Background → {label} (daemon applies within ~1s).")
+        }
+        Err(e) => format!("Save failed: {e}"),
+    };
+}
+
+/// Signal the daemon to reload the *currently chosen* backdrop from disk: bump the
+/// generation counter and save `display.json`. Useful when the selected file was
+/// overwritten in place (cycling already triggers a reload when the file changes).
 fn request_background_reload(app: &mut App) {
     app.display.background_generation = app.display.background_generation.wrapping_add(1);
     app.status = match app.display.save() {
-        Ok(()) => match crate::state::background_path() {
+        Ok(()) => match crate::state::background_path_for(&app.display) {
             Some(_) => "Reloading background — the daemon applies it within ~1s.".to_string(),
-            None => {
-                "No background.{png,jpg,jpeg} in the config dir — using solid colour.".to_string()
-            }
+            None => "No background selected — using solid colour.".to_string(),
         },
         Err(e) => format!("Save failed: {e}"),
     };
@@ -887,16 +925,13 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         }
         items.push(field_item(&format!("Channel {} name", i + 1), val));
     }
-    // Action row: reload the panel backdrop from disk on demand.
-    let bg_hint = match crate::state::background_path() {
-        Some(p) => p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("set")
-            .to_string(),
-        None => "no file found".to_string(),
+    // Background row: cycle through images in the config backgrounds/ dir.
+    let bg_label = match &d.background_file {
+        Some(name) => name.clone(),
+        None if app.backgrounds.is_empty() => "(no files in backgrounds/)".to_string(),
+        None => "(off)".to_string(),
     };
-    items.push(field_item("Reload background", format!("⏎  ({bg_hint})")));
+    items.push(field_item("Background", format!("◂ {bg_label} ▸")));
     let list = List::new(items)
         .block(Block::bordered().title(" Panel display "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -905,8 +940,8 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
 
     let help = if !app.status.is_empty() {
         app.status.clone()
-    } else if sel == REFRESH_FIELD {
-        "↑/↓ select · Enter reload background · Tab routing · q quit".to_string()
+    } else if sel == BACKGROUND_FIELD {
+        "↑/↓ select · ←/→ change background · Enter reload · Tab routing · q quit".to_string()
     } else if sel == OUTPUT_FIELD {
         "↑/↓ select · ←/→ change output device · Tab routing · q quit".to_string()
     } else if sel >= NAME_FIELD_BASE {

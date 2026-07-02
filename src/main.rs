@@ -5,6 +5,8 @@
 //! the host as PipeWire null-sinks, and we map the hardware encoders onto their
 //! volumes. See README / plan for the full picture.
 
+#[cfg(feature = "gui")]
+mod gui;
 mod mix;
 mod pw;
 mod screen;
@@ -68,6 +70,8 @@ enum Command {
     Assign,
     /// Terminal UI to view and manage channel routing (runs alongside the daemon).
     Tui,
+    /// GUI window to manage routing and settings (mouse-driven; requires `--features gui`).
+    Gui,
     /// Print raw hardware events (dial/button) — a hardware sanity check.
     Events,
     /// Render a sample panel image to a file (no hardware needed).
@@ -86,6 +90,18 @@ fn main() -> Result<()> {
         Command::Teardown => cmd_teardown(),
         Command::Assign => cmd_assign(),
         Command::Tui => tui::run(),
+        Command::Gui => {
+            #[cfg(feature = "gui")]
+            {
+                gui::run()
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!(
+                    "GUI support not compiled in. Rebuild with: cargo build --features gui"
+                )
+            }
+        }
         Command::Events => cmd_events(),
         Command::Preview { path } => cmd_preview(&path),
     }
@@ -122,7 +138,8 @@ fn cmd_preview(path: &str) -> Result<()> {
             is_mic: true,
         },
     ];
-    let background = state::background_path().and_then(|p| screen::load_background(&p));
+    let display = DisplayConfig::load().unwrap_or_default();
+    let background = state::background_path_for(&display).and_then(|p| screen::load_background(&p));
     let jpeg = screen::render(&views, background.as_ref())?;
     std::fs::write(path, &jpeg).with_context(|| format!("writing {path}"))?;
     println!("Wrote sample panel ({} bytes) to {path}", jpeg.len());
@@ -304,13 +321,14 @@ fn cmd_run() -> Result<()> {
         for _ in m.events.try_iter() {}
     }
 
-    // Optional backdrop image. Loaded once here, then reloaded on demand when the
-    // TUI bumps `DisplayConfig.background_generation` (so dropping a new
-    // background.jpg in the config dir can be picked up without a restart).
-    let mut background = load_background();
-
-    // Display behaviour (dim timeout + brightness), re-read live from the TUI.
+    // Display behaviour (dim timeout + brightness + chosen backdrop), re-read
+    // live from the TUI.
     let mut display = DisplayConfig::load().unwrap_or_default();
+
+    // Optional backdrop image. Loaded once here, then reloaded on demand when the
+    // TUI cycles `DisplayConfig.background_file` or bumps `background_generation`
+    // (so a different / overwritten image is picked up without a restart).
+    let mut background = load_background(&display);
     mix.as_ref().unwrap().init_display(display.full_brightness);
 
     let mut sources = channel_sources(&mics);
@@ -517,9 +535,12 @@ fn cmd_run() -> Result<()> {
 
                     let cfg = DisplayConfig::load().unwrap_or_default();
                     if cfg != display {
-                        // A bumped generation is the TUI's "reload background" signal.
-                        if cfg.background_generation != display.background_generation {
-                            background = load_background();
+                        // Reload the backdrop when the chosen file changes, or when
+                        // the TUI bumps the generation (overwrite-in-place reload).
+                        if cfg.background_file != display.background_file
+                            || cfg.background_generation != display.background_generation
+                        {
+                            background = load_background(&cfg);
                         }
                         display = cfg;
                         mix_ref.set_brightness(brightness_for(screen, &display));
@@ -552,10 +573,11 @@ fn cmd_run() -> Result<()> {
     }
 }
 
-/// Load the optional panel backdrop from the config dir, logging what it found.
-/// Returns `None` (solid colour) when no usable image is present.
-fn load_background() -> Option<RgbImage> {
-    state::background_path().and_then(|p| {
+/// Load the backdrop the display config selects (a file under `backgrounds/`),
+/// logging what it found. Returns `None` (solid colour) when nothing is selected
+/// or the chosen file is missing/undecodable.
+fn load_background(display: &DisplayConfig) -> Option<RgbImage> {
+    state::background_path_for(display).and_then(|p| {
         let bg = screen::load_background(&p);
         if bg.is_some() {
             log::info!("Using background image {}", p.display());

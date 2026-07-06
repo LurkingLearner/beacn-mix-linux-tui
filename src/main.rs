@@ -10,6 +10,7 @@ mod gui;
 mod levels;
 mod mix;
 mod pw;
+mod routing;
 mod screen;
 mod state;
 mod tui;

@@ -10,7 +10,8 @@
 
 use crate::mix::Channel;
 use crate::pw;
-use crate::state::{Bindings, DisplayConfig, Levels, OutputConfig};
+use crate::routing::{self, Row};
+use crate::state::{DisplayConfig, Levels, OutputConfig};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -23,7 +24,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
-use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
@@ -84,120 +84,18 @@ enum UnEntry {
     Item(usize),
 }
 
-/// One manageable entry: a live playback stream, an app that's bound to a
-/// channel but isn't currently playing, or a capture device (mic) that can ride
-/// a channel's gain.
-#[derive(Clone)]
-enum Row {
-    Live {
-        index: u32,
-        app: String,
-        label: String,
-        channel: Option<Channel>,
-    },
-    Idle {
-        app: String,
-        channel: Channel,
-    },
-    Mic {
-        /// Source node name (the pactl handle).
-        name: String,
-        /// Friendly description for display.
-        label: String,
-        /// Channel this mic is currently bound to, if any.
-        channel: Option<Channel>,
-    },
-}
-
-impl Row {
-    /// A short human label for status messages.
-    fn app(&self) -> &str {
-        match self {
-            Row::Live { app, .. } | Row::Idle { app, .. } => app,
-            Row::Mic { label, .. } => label,
-        }
-    }
-
-    fn channel(&self) -> Option<Channel> {
-        match self {
-            Row::Live { channel, .. } | Row::Mic { channel, .. } => *channel,
-            Row::Idle { channel, .. } => Some(*channel),
-        }
-    }
-
-    fn stream_index(&self) -> Option<u32> {
-        match self {
-            Row::Live { index, .. } => Some(*index),
-            Row::Idle { .. } | Row::Mic { .. } => None,
-        }
-    }
-
-    /// The friendly display name (no channel prefix): the stream/app label, or
-    /// the mic's description. Used for list rendering and filter matching.
-    fn name(&self) -> &str {
-        match self {
-            Row::Live { label, .. } | Row::Mic { label, .. } => label,
-            Row::Idle { app, .. } => app,
-        }
-    }
-}
-
 struct Snapshot {
     rows: Vec<Row>,
     levels: Levels,
 }
 
 /// Read the current PipeWire streams + bindings + levels into a fresh snapshot.
+/// The row-building itself is shared with the GUI (see `src/routing.rs`).
 fn snapshot() -> Snapshot {
-    let streams = pw::app_streams().unwrap_or_default();
-    let bindings = Bindings::load().unwrap_or_default();
-    let levels = Levels::load().unwrap_or_default();
-
-    let live_apps: HashSet<&str> = streams.iter().map(|s| s.app.as_str()).collect();
-
-    let mut rows: Vec<Row> = streams
-        .iter()
-        .map(|s| Row::Live {
-            index: s.index,
-            app: s.app.clone(),
-            label: s.label(),
-            channel: pw::channel_of_sink(&s.sink),
-        })
-        .collect();
-
-    // Bound apps that aren't currently playing — still worth showing/unbinding.
-    for ch in Channel::ALL {
-        for app in bindings.apps_for_channel(ch) {
-            if !live_apps.contains(app.as_str()) {
-                rows.push(Row::Idle { app, channel: ch });
-            }
-        }
+    Snapshot {
+        rows: routing::rows(),
+        levels: Levels::load().unwrap_or_default(),
     }
-
-    // Capture devices (mics): one row each, showing which channel (if any) they
-    // ride. Selecting one + 1-4 binds it so that channel's encoder rides its gain.
-    let mics = pw::list_sources().unwrap_or_default();
-    let present: HashSet<&str> = mics.iter().map(|m| m.name.as_str()).collect();
-    for m in &mics {
-        rows.push(Row::Mic {
-            name: m.name.clone(),
-            label: m.label().to_string(),
-            channel: bindings.channel_for_mic(&m.name),
-        });
-    }
-    // Bound mics whose device isn't currently present (e.g. a wireless mic that's
-    // detached) — still show them so they can be unbound.
-    for (name, &ch) in &bindings.mic_by_source {
-        if !present.contains(name.as_str()) {
-            rows.push(Row::Mic {
-                name: name.clone(),
-                label: name.clone(),
-                channel: Some(Channel(ch)),
-            });
-        }
-    }
-
-    Snapshot { rows, levels }
 }
 
 /// Indices into `snap.rows` of the rows currently assigned to channel `ch`
@@ -273,38 +171,6 @@ fn next_item(entries: &[UnEntry], from: Option<usize>, dir: i64) -> Option<usize
             None => Some(items.into_iter().find(|&i| i >= cur).unwrap_or(last)),
         },
     }
-}
-
-/// Bind a row to a channel: move its live stream (if any) and persist the
-/// binding. For a mic there's no graph move — we just persist the binding and the
-/// daemon starts riding that mic's gain on the channel within ~1s.
-fn assign(row: &Row, ch: Channel) -> Result<()> {
-    let mut bindings = Bindings::load().unwrap_or_default();
-    if let Row::Mic { name, .. } = row {
-        bindings.set_mic(ch, name);
-        return bindings.save();
-    }
-    if let Some(idx) = row.stream_index() {
-        pw::move_stream(idx, ch)?;
-    }
-    bindings.set(row.app(), ch);
-    bindings.save()
-}
-
-/// Drop a row's binding. For an app, move its live stream back to the default
-/// output; for a mic, just clear the binding (the daemon stops riding its gain).
-fn unassign(row: &Row) -> Result<()> {
-    let mut bindings = Bindings::load().unwrap_or_default();
-    if let Row::Mic { name, .. } = row {
-        bindings.remove_mic(name);
-        return bindings.save();
-    }
-    if let Some(idx) = row.stream_index() {
-        let default = pw::default_sink()?;
-        pw::move_to_sink(idx, &default)?;
-    }
-    bindings.remove(row.app());
-    bindings.save()
 }
 
 /// Nudge a settings field by `dir` (±1), each field with its own step + bounds.
@@ -545,7 +411,7 @@ fn handle_routing_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(c @ '1'..='4') => {
             let ch = Channel(c as usize - '1' as usize);
             if let Some(row) = selected_row_index(app).map(|i| app.snap.rows[i].clone()) {
-                app.status = match assign(&row, ch) {
+                app.status = match routing::assign(&row, ch) {
                     Ok(()) => format!("Assigned {} → CH{}", row.app(), ch.human()),
                     Err(e) => format!("Assign failed: {e}"),
                 };
@@ -554,7 +420,7 @@ fn handle_routing_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('u') => {
             if let Some(row) = selected_row_index(app).map(|i| app.snap.rows[i].clone()) {
-                app.status = match unassign(&row) {
+                app.status = match routing::unassign(&row) {
                     Ok(()) => format!("Unassigned {}", row.app()),
                     Err(e) => format!("Unassign failed: {e}"),
                 };
@@ -983,6 +849,7 @@ mod tests {
             name: format!("node.{label}"),
             label: label.to_string(),
             channel,
+            present: true,
         }
     }
 

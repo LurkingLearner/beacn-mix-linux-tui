@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Beacn Mix
+Comment=PipeWire channel mixer for the Beacn Mix USB control surface
+Exec=beacn-mix gui
+Icon=multimedia-volume-control
+Categories=Audio;AudioVideo;Mixer;
+Terminal=false
+StartupNotify=true

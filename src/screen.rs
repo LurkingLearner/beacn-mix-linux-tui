@@ -46,6 +46,17 @@ const GAUGE_START: f32 = 135.0;
 const GAUGE_SWEEP: f32 = 270.0;
 const VOLUME_MAX: f32 = 150.0;
 
+// Live-level meter: a thinner concentric arc just inside the volume band
+// (volume band spans r 57..71, meter band r 43..49 — a 8 px gap keeps them
+// reading as two rings, and the meter stays clear of the centred volume
+// number, which is at most ~39 px wide for "150").
+const METER_R: f32 = 46.0;
+const METER_TH: i32 = 6;
+/// How far the meter colour is blended from the channel accent toward `FG`:
+/// lighter than the accent so it reads as "signal", but thin enough that the
+/// volume arc stays dominant.
+const METER_BLEND: f32 = 0.5;
+
 // Label + source list below the gauge.
 const LABEL_Y: i32 = 196;
 const UNDERLINE_Y: i32 = 228;
@@ -67,6 +78,11 @@ pub struct ChannelView {
     /// True when this channel rides a mic's gain (input) rather than a sink
     /// (output): draws a mic marker, and a mic glyph for the mute icon.
     pub is_mic: bool,
+    /// Live audio level as the *displayed* fraction (0..=1) — already
+    /// perceptually mapped (dBFS) by the caller. Drawn as a thin concentric
+    /// arc inside the volume band; 0 draws nothing, and a muted channel never
+    /// shows a meter (the mute icon is the story there).
+    pub level: f32,
 }
 
 /// Load a backdrop image, scaled to cover 800×480 and darkened for legibility.
@@ -184,6 +200,22 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
         );
     }
 
+    // Live level: a thinner concentric arc inside the volume band, same
+    // angular range. Hidden while muted — the centre mute icon is the story
+    // there, and a "live" ring under it would read as still audible.
+    if !view.muted && view.level > 0.01 {
+        let meter_end = GAUGE_START + view.level.clamp(0.0, 1.0) * GAUGE_SWEEP;
+        draw_arc(
+            img,
+            (cx, GAUGE_CY),
+            METER_R,
+            METER_TH,
+            GAUGE_START,
+            meter_end,
+            blend(accent, FG, METER_BLEND),
+        );
+    }
+
     // 100% headroom pip, just outside the band.
     let pip = (GAUGE_START + (100.0 / VOLUME_MAX) * GAUGE_SWEEP).to_radians();
     let pr = GAUGE_R + GAUGE_TH as f32 / 2.0 + 5.0;
@@ -217,6 +249,13 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
             &s,
         );
     }
+}
+
+/// Linear blend between two colours (`t` = 0 → `a`, `t` = 1 → `b`).
+fn blend(a: Rgb<u8>, b: Rgb<u8>, t: f32) -> Rgb<u8> {
+    Rgb(std::array::from_fn(|i| {
+        (a.0[i] as f32 + (b.0[i] as f32 - a.0[i] as f32) * t).round() as u8
+    }))
 }
 
 /// Draw a thick arc by stepping filled circles along its centreline (rounded caps).
@@ -408,6 +447,7 @@ mod tests {
             muted: false,
             apps: vec![],
             is_mic: false,
+            level: 0.0,
         })
     }
 
@@ -419,6 +459,7 @@ mod tests {
                 muted: false,
                 apps: vec!["Firefox".into(), "YouTube Music".into()],
                 is_mic: false,
+                level: 0.6,
             },
             ChannelView {
                 label: "CH 2".into(),
@@ -426,6 +467,7 @@ mod tests {
                 muted: true,
                 apps: vec!["Discord".into()],
                 is_mic: false,
+                level: 0.4,
             },
             ChannelView {
                 label: "CH 3".into(),
@@ -433,6 +475,7 @@ mod tests {
                 muted: false,
                 apps: vec!["Spotify".into()],
                 is_mic: false,
+                level: 0.0,
             },
             ChannelView {
                 label: "Mic".into(),
@@ -440,6 +483,7 @@ mod tests {
                 muted: false,
                 apps: vec!["Yeti Microphone".into()],
                 is_mic: true,
+                level: 0.8,
             },
         ]
     }
@@ -643,6 +687,50 @@ mod tests {
             }
         }
         assert!(found_mute, "muted mic must show the red slash");
+    }
+
+    #[test]
+    fn level_meter_draws_inner_arc_in_blended_colour() {
+        let mut views = empty_views();
+        views[0].volume = 100;
+        views[0].level = 0.5;
+        let img = render_rgb(&views, None).expect("render");
+        // Quarter-sweep (0.25) is inside the 0.5 meter fill. Sample the meter
+        // centreline at METER_R — it must be the accent-toward-FG blend.
+        let rad = (GAUGE_START + GAUGE_SWEEP * 0.25).to_radians();
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + METER_R * rad.cos()).round();
+        let y = (GAUGE_CY as f32 + METER_R * rad.sin()).round();
+        assert_eq!(
+            *img.get_pixel(x as u32, y as u32),
+            blend(ACCENT[0], FG, METER_BLEND),
+            "meter arc must use the blended accent colour"
+        );
+        // Past the fill (0.75 of the sweep) the meter band must be background.
+        let rad = (GAUGE_START + GAUGE_SWEEP * 0.75).to_radians();
+        let x = (cx as f32 + METER_R * rad.cos()).round();
+        let y = (GAUGE_CY as f32 + METER_R * rad.sin()).round();
+        assert_eq!(*img.get_pixel(x as u32, y as u32), BG);
+    }
+
+    #[test]
+    fn muted_channel_hides_the_level_meter() {
+        let mut views = empty_views();
+        views[0].volume = 100;
+        views[0].muted = true;
+        views[0].level = 1.0;
+        let img = render_rgb(&views, None).expect("render");
+        // With a full-scale level but muted, no meter pixel may appear at the
+        // very start of the sweep (safely away from the centre mute icon).
+        let rad = GAUGE_START.to_radians();
+        let cx = (COL_W / 2) as i32;
+        let x = (cx as f32 + METER_R * rad.cos()).round();
+        let y = (GAUGE_CY as f32 + METER_R * rad.sin()).round();
+        assert_ne!(
+            *img.get_pixel(x as u32, y as u32),
+            blend(ACCENT[0], FG, METER_BLEND),
+            "muted channel must not draw the meter"
+        );
     }
 
     #[test]

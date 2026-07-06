@@ -450,6 +450,17 @@ impl Source {
     }
 }
 
+/// Names of every source that currently exists, **monitors included** (from
+/// `pactl list short sources`). The level meter uses this to know which capture
+/// targets are actually present right now — unlike [`list_sources`], monitors
+/// are wanted here because channel meters capture `BeacnChN.monitor`.
+pub fn source_names_short() -> Result<Vec<String>> {
+    Ok(pactl(&["list", "short", "sources"])?
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1).map(str::to_owned))
+        .collect())
+}
+
 /// Enumerate real capture devices (mics) by parsing verbose `pactl list sources`,
 /// skipping sink monitors (our channel loopbacks and every other sink's `.monitor`).
 pub fn list_sources() -> Result<Vec<Source>> {

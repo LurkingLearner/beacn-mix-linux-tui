@@ -7,6 +7,7 @@
 
 #[cfg(feature = "gui")]
 mod gui;
+mod levels;
 mod mix;
 mod pw;
 mod screen;
@@ -29,6 +30,10 @@ use std::time::{Duration, Instant};
 /// How much each encoder tick moves a channel's volume, in percent.
 const VOLUME_STEP: i32 = 2;
 const VOLUME_MAX: i32 = 150;
+/// The displayed audio level is quantized to this many steps (2% each) so a
+/// meter that hasn't visibly moved never marks the screen dirty — a silent
+/// system keeps its throttled "no frames unless something changed" behaviour.
+const LEVEL_STEPS: u8 = 50;
 /// How often to re-assert brightness + ping the device so the firmware keeps the
 /// panel lit (dim or full) and beacn-lib's own dimmer never fires.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -115,6 +120,7 @@ fn cmd_preview(path: &str) -> Result<()> {
             muted: false,
             apps: vec!["Firefox".into(), "YouTube Music".into()],
             is_mic: false,
+            level: 0.68,
         },
         ChannelView {
             label: "Chat".into(),
@@ -122,6 +128,7 @@ fn cmd_preview(path: &str) -> Result<()> {
             muted: true,
             apps: vec!["Discord".into(), "Zoom".into()],
             is_mic: false,
+            level: 0.5, // hidden: muted channels never show the meter
         },
         ChannelView {
             label: "Music".into(),
@@ -129,6 +136,7 @@ fn cmd_preview(path: &str) -> Result<()> {
             muted: false,
             apps: vec!["Spotify".into()],
             is_mic: false,
+            level: 0.0,
         },
         ChannelView {
             label: "Mic".into(),
@@ -136,6 +144,7 @@ fn cmd_preview(path: &str) -> Result<()> {
             muted: false,
             apps: vec!["Yeti Microphone".into()],
             is_mic: true,
+            level: 0.9,
         },
     ];
     let display = DisplayConfig::load().unwrap_or_default();
@@ -295,6 +304,12 @@ fn cmd_run() -> Result<()> {
     // capture device's gain/mute instead of the output sink. Re-read live below.
     let mut mics = mic_bindings();
 
+    // Live level metering: capture each channel's monitor (or its bound mics)
+    // and show a thin meter arc inside the volume gauge. Targets are re-pointed
+    // whenever the mic bindings change.
+    let meter = levels::LevelMeter::new();
+    meter.set_targets(meter_targets(&mics));
+
     // Restore the channel levels/mutes from the last session, applying each to
     // whatever the channel currently drives (its mic, or its sink).
     let saved = Levels::load().unwrap_or_default();
@@ -332,6 +347,9 @@ fn cmd_run() -> Result<()> {
     mix.as_ref().unwrap().init_display(display.full_brightness);
 
     let mut sources = channel_sources(&mics);
+    // Last levels drawn on the panel, quantized to LEVEL_STEPS — the meters
+    // only mark the screen dirty when one of these actually changes.
+    let mut shown_levels = [0u8; 4];
     let _ = refresh_screen(
         mix.as_ref().unwrap(),
         &display,
@@ -339,6 +357,7 @@ fn cmd_run() -> Result<()> {
         &volumes,
         &mutes,
         &mics,
+        &shown_levels,
         background.as_ref(),
     );
 
@@ -393,6 +412,7 @@ fn cmd_run() -> Result<()> {
                             &volumes,
                             &mutes,
                             &mics,
+                            &shown_levels,
                             background.as_ref(),
                         ) {
                             log::warn!("post-reconnect screen push failed: {e:#}");
@@ -481,8 +501,21 @@ fn cmd_run() -> Result<()> {
                 }
                 last_tick = now;
 
+                // Live meters: mark dirty only when a channel's *displayed*
+                // (quantized) level moved, and never while dimmed — playing
+                // audio must not keep pushing frames to a dimmed panel, and
+                // level motion deliberately does not count as activity for
+                // the dim timer.
+                if screen == Screen::Active {
+                    let next_levels = quantized_levels(&meter);
+                    if next_levels != shown_levels {
+                        shown_levels = next_levels;
+                        dirty = true;
+                    }
+                }
+
                 if dirty {
-                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, background.as_ref()) {
+                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, &shown_levels, background.as_ref()) {
                         // Transport failure = the device is gone. Anything else
                         // (e.g. a JPEG decoder hiccup) is logged inside refresh_screen.
                         log::warn!("screen update failed: {e}");
@@ -509,6 +542,8 @@ fn cmd_run() -> Result<()> {
                         for ch in Channel::ALL {
                             apply_level(ch, &mics, volumes[ch.0], mutes[ch.0]);
                         }
+                        // Re-point the level meters (mic gain vs. sink monitor).
+                        meter.set_targets(meter_targets(&mics));
                         dirty = true;
                     }
 
@@ -597,6 +632,7 @@ fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
 /// Build the four channel tiles from precomputed sources + current volumes/mutes
 /// and push them to the device. Returns `Err` only on transport failure (device
 /// gone) — a render failure is logged and treated as non-fatal.
+#[allow(clippy::too_many_arguments)]
 fn refresh_screen(
     mix: &Mix,
     display: &DisplayConfig,
@@ -604,6 +640,7 @@ fn refresh_screen(
     volumes: &[u32; 4],
     mutes: &[bool; 4],
     mics: &[Vec<String>; 4],
+    levels: &[u8; 4],
     background: Option<&RgbImage>,
 ) -> Result<()> {
     let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
@@ -612,6 +649,7 @@ fn refresh_screen(
         muted: mutes[i],
         apps: sources[i].clone(),
         is_mic: !mics[i].is_empty(),
+        level: levels[i] as f32 / LEVEL_STEPS as f32,
     });
     let jpeg = match screen::render(&views, background) {
         Ok(j) => j,
@@ -669,6 +707,26 @@ fn channel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
 /// The per-channel mic bindings (channel -> the capture devices riding it).
 fn mic_bindings() -> [Vec<String>; 4] {
     Bindings::load().unwrap_or_default().mics_array()
+}
+
+/// What each channel's level meter should capture: the bound mics when there
+/// are any (the meter then shows the loudest of them — i.e. you talking),
+/// otherwise the channel sink's monitor (the audio apps play into it).
+fn meter_targets(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
+    std::array::from_fn(|i| {
+        if mics[i].is_empty() {
+            vec![format!("{}.monitor", pw::sink_name(Channel(i)))]
+        } else {
+            mics[i].clone()
+        }
+    })
+}
+
+/// Current per-channel displayed levels, perceptually mapped (dBFS) and
+/// quantized to `LEVEL_STEPS` so tiny fluctuations don't churn the panel.
+fn quantized_levels(meter: &levels::LevelMeter) -> [u8; 4] {
+    let raw = meter.levels();
+    std::array::from_fn(|i| (levels::display_fraction(raw[i]) * LEVEL_STEPS as f32).round() as u8)
 }
 
 /// Apply a channel's volume to whatever it currently drives: every bound mic's

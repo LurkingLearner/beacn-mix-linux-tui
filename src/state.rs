@@ -84,6 +84,12 @@ impl Paths {
         self.state_dir.join("levels.json")
     }
 
+    /// Local socket through which front-ends ask the running daemon to make a
+    /// live state change (rather than only editing its next-startup state).
+    pub fn control_socket(&self) -> PathBuf {
+        self.state_dir.join("control.sock")
+    }
+
     pub fn modules(&self) -> PathBuf {
         self.state_dir.join("modules.json")
     }
@@ -163,6 +169,11 @@ fn modules_path() -> PathBuf {
 
 fn levels_path() -> PathBuf {
     current_paths().levels()
+}
+
+/// Path of the local daemon-control socket.
+pub fn control_socket_path() -> PathBuf {
+    current_paths().control_socket()
 }
 
 fn display_path() -> PathBuf {

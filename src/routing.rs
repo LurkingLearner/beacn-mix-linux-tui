@@ -159,3 +159,60 @@ pub fn unassign(row: &Row) -> Result<()> {
     bindings.remove(row.app());
     bindings.save()
 }
+
+/// The per-channel mic bindings (channel -> the capture devices riding it).
+/// Shared by the daemon and panel preview so both make the same mic-first
+/// routing decision.
+pub fn mic_bindings() -> [Vec<String>; 4] {
+    Bindings::load().unwrap_or_default().mics_array()
+}
+
+/// Per-channel labels for the device panel, derived from the same live routing
+/// rules the daemon uses. Channels with mics show only those mic names; the
+/// remaining channels show live stream labels, falling back to saved app
+/// bindings when idle.
+pub fn panel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
+    let streams = pw::app_streams().unwrap_or_default();
+    let bindings = Bindings::load().unwrap_or_default();
+    let source_list = if mics.iter().any(|m| !m.is_empty()) {
+        pw::list_sources().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    std::array::from_fn(|i| {
+        let ch = Channel(i);
+        if !mics[i].is_empty() {
+            return mics[i]
+                .iter()
+                .map(|name| {
+                    source_list
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .map(|s| s.label().to_string())
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect();
+        }
+        let live: Vec<String> = streams
+            .iter()
+            .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
+            .map(|s| panel_label(s).to_string())
+            .collect();
+        if live.is_empty() {
+            bindings.apps_for_channel(ch)
+        } else {
+            live
+        }
+    })
+}
+
+/// Longest `media.name` we'll show in place of the app name on the panel.
+const PANEL_LABEL_MAX: usize = 13;
+
+fn panel_label(s: &pw::Stream) -> &str {
+    if !s.media.is_empty() && s.media != s.app && s.media.chars().count() <= PANEL_LABEL_MAX {
+        &s.media
+    } else {
+        &s.app
+    }
+}

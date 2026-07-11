@@ -1,12 +1,20 @@
 //! GUI configuration window (egui/eframe). A mouse-driven alternative to the
-//! terminal TUI. Reads/writes the same JSON files the daemon already reacts to,
-//! so it runs alongside `run` just like `tui` does — no IPC, no daemon changes.
+//! terminal TUI. Routing/settings use the shared JSON state; live mute changes
+//! are submitted to the running daemon so its in-memory state stays authoritative.
+//!
+//! The Routing tab embeds a live 1:1 render of the 800×480 device panel
+//! (via `screen::render_rgb`, cached as a texture and re-rendered only when the
+//! inputs change), so you assign/mute against the exact bitmap the daemon ships
+//! to the hardware. Assignment is drag-and-drop (drag an app/mic onto a channel,
+//! or between channels) with CH1..4 buttons kept as a click fallback.
 #![cfg(feature = "gui")]
 
+use crate::control::{self, Command};
 use crate::mix::Channel;
 use crate::pw;
 use crate::routing::{self, Row};
-use crate::state::{DisplayConfig, Levels, OutputConfig};
+use crate::screen::{self, ChannelView};
+use crate::state::{self, DisplayConfig, Levels, OutputConfig};
 use anyhow::Result;
 use eframe::egui;
 use std::time::{Duration, Instant};
@@ -40,7 +48,7 @@ enum Tab {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
+            .with_inner_size([900.0, 760.0])
             .with_title("Beacn Mix — Routing"),
         ..Default::default()
     };
@@ -90,10 +98,20 @@ struct BeacnGui {
     /// True while a channel-name text field held focus last frame. Blocks the
     /// periodic `display.json` reload from stomping the in-progress edit.
     name_edit_focused: bool,
+    /// Cached render of the device panel for the Routing tab, keyed by a hash of
+    /// its inputs so we only rebuild the 800×480 bitmap + texture when something
+    /// visible actually changed.
+    panel_tex: Option<egui::TextureHandle>,
+    panel_sig: u64,
+    /// Exact source labels and mic routing used by the daemon's panel render.
+    panel_mics: [Vec<String>; 4],
+    panel_sources: [Vec<String>; 4],
 }
 
 impl Default for BeacnGui {
     fn default() -> Self {
+        let panel_mics = routing::mic_bindings();
+        let panel_sources = routing::panel_sources(&panel_mics);
         Self {
             tab: Tab::Routing,
             rows: routing::rows(),
@@ -106,6 +124,10 @@ impl Default for BeacnGui {
             status: String::new(),
             last_refresh: Instant::now(),
             name_edit_focused: false,
+            panel_tex: None,
+            panel_sig: 0,
+            panel_mics,
+            panel_sources,
         }
     }
 }
@@ -117,6 +139,8 @@ impl BeacnGui {
     fn refresh(&mut self) {
         self.rows = routing::rows();
         self.levels = Levels::load().unwrap_or_default();
+        self.panel_mics = routing::mic_bindings();
+        self.panel_sources = routing::panel_sources(&self.panel_mics);
         self.outputs = pw::list_outputs().unwrap_or_default();
         self.reload_config_files();
         self.last_refresh = Instant::now();
@@ -138,6 +162,60 @@ impl BeacnGui {
         if !self.name_edit_focused {
             self.display = DisplayConfig::load().unwrap_or_default();
         }
+    }
+
+    // ── panel preview ───────────────────────────────────────────────────────
+
+    /// The four [`ChannelView`]s the panel renderer wants, built from the same
+    /// panel sources / levels / display config the daemon uses. `level` is left at 0 —
+    /// the live audio meter is computed by the daemon and isn't available here.
+    fn channel_views(&self) -> [ChannelView; 4] {
+        std::array::from_fn(|i| ChannelView {
+            label: self.display.channel_label(i),
+            volume: self.levels.volumes[i],
+            muted: self.levels.mutes[i],
+            apps: self.panel_sources[i].clone(),
+            is_mic: !self.panel_mics[i].is_empty(),
+            level: 0.0,
+        })
+    }
+
+    /// A hash of everything that affects the panel bitmap, so we can skip the
+    /// (relatively expensive) re-render + texture upload when nothing changed.
+    fn panel_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for i in 0..4 {
+            self.display.channel_label(i).hash(&mut h);
+            self.levels.volumes[i].hash(&mut h);
+            self.levels.mutes[i].hash(&mut h);
+        }
+        for i in 0..4 {
+            self.panel_mics[i].hash(&mut h);
+            self.panel_sources[i].hash(&mut h);
+        }
+        self.display.background_file.hash(&mut h);
+        self.display.background_generation.hash(&mut h);
+        h.finish()
+    }
+
+    /// Return the current panel texture, rebuilding it if the inputs changed.
+    fn panel_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        let sig = self.panel_signature();
+        if self.panel_tex.is_none() || self.panel_sig != sig {
+            let views = self.channel_views();
+            let bg =
+                state::background_path_for(&self.display).and_then(|p| screen::load_background(&p));
+            let img = screen::render_rgb(&views, bg.as_ref()).unwrap_or_else(|_| {
+                image::RgbImage::from_pixel(800, 480, image::Rgb([18, 20, 26]))
+            });
+            let size = [img.width() as usize, img.height() as usize];
+            let color = egui::ColorImage::from_rgb(size, img.as_raw());
+            self.panel_tex =
+                Some(ctx.load_texture("panel_preview", color, egui::TextureOptions::LINEAR));
+            self.panel_sig = sig;
+        }
+        self.panel_tex.clone().expect("texture just set")
     }
 }
 
@@ -177,7 +255,12 @@ impl eframe::App for BeacnGui {
             }
             ui.separator();
 
-            // ── Main content (leave room for the status bar below) ──
+            // ── Live 1:1 device-panel preview (stays on top for BOTH tabs) ──
+            panel_preview(ui, self);
+            ui.add_space(8.0);
+            ui.separator();
+
+            // ── Tab body: only the area below the preview switches ──
             let body_height = (ui.available_height() - STATUS_BAR_RESERVE).max(60.0);
             match self.tab {
                 Tab::Routing => {
@@ -216,12 +299,14 @@ struct RoutingData {
     unassigned_mics: Vec<(usize, String)>,
 }
 
-/// A click collected during the frame; applied (and followed by a refresh)
-/// only after all lists have finished rendering, so the row indices in
+/// A click / drop collected during the frame; applied (and followed by a
+/// refresh) only after all lists have finished rendering, so the row indices in
 /// [`RoutingData`] stay valid for the whole frame.
 enum Action {
     Assign(usize, Channel),
     Unassign(usize),
+    /// Toggle a channel's mute through the running daemon.
+    ToggleMute(usize),
 }
 
 fn routing_data(s: &BeacnGui) -> RoutingData {
@@ -267,13 +352,33 @@ fn routing_data(s: &BeacnGui) -> RoutingData {
     }
 }
 
+// ── Panel preview (shared by both tabs) ─────────────────────────────────────
+
+/// Draw the live 1:1 render of the 800×480 device panel, scaled to fit the
+/// window width. Shown above the tab body on both Routing and Settings, so
+/// Settings changes are seen landing on the same preview.
+fn panel_preview(ui: &mut egui::Ui, s: &mut BeacnGui) {
+    let tex = s.panel_texture(ui.ctx());
+    let avail = ui.available_width().min(800.0);
+    let scale = (avail / 800.0).min(1.0);
+    let sized = egui::load::SizedTexture::new(tex.id(), egui::vec2(800.0 * scale, 480.0 * scale));
+    ui.add(egui::Image::new(sized));
+    ui.label(
+        egui::RichText::new("This mirrors the panel bitmap the daemon sends to the hardware.")
+            .color(egui::Color32::GRAY)
+            .small(),
+    );
+}
+
 // ── Routing tab ────────────────────────────────────────────────────────────
 
-/// One list row: `label ... [buttons]` with the buttons pinned to the right
-/// edge and the label truncating (with a hover tooltip for the full text) so
-/// long stream titles can never push the buttons out of reach.
-fn item_row(
+/// A draggable list row: `label ... [buttons]` with the buttons pinned to the
+/// right edge and the label truncating (hover tooltip for the full text). The
+/// whole label area is a drag source carrying the row index; `buttons` renders
+/// any trailing controls (unassign ✖, or the CH1..4 assign fallback).
+fn draggable_row(
     ui: &mut egui::Ui,
+    idx: usize,
     label: &str,
     text: egui::RichText,
     buttons: impl FnOnce(&mut egui::Ui),
@@ -282,8 +387,13 @@ fn item_row(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             buttons(ui);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(text).truncate())
-                    .on_hover_text(label);
+                let id = egui::Id::new(("dnd_row", idx));
+                let resp = ui
+                    .dnd_drag_source(id, idx, |ui| {
+                        ui.add(egui::Label::new(text).truncate().selectable(false));
+                    })
+                    .response;
+                resp.on_hover_text(format!("{label}  ·  drag onto a channel"));
             });
         });
     });
@@ -292,55 +402,15 @@ fn item_row(
 fn routing_ui(ui: &mut egui::Ui, s: &mut BeacnGui, data: &RoutingData, max_height: f32) {
     let mut action: Option<Action> = None;
 
-    // The whole tab body scrolls, so the filter field and the Apps/Mics lists
-    // stay reachable at small window heights.
     egui::ScrollArea::vertical()
         .id_salt("routing_page")
         .max_height(max_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // ── four channel columns ──
+            // ── Four channel drop-columns (aligned under the preview) ──
             ui.columns(4, |cols| {
                 for i in 0..4 {
-                    cols[i].vertical_centered(|ui| {
-                        ui.heading(egui::RichText::new(format!("CH{}", i + 1)).color(ACCENT[i]));
-                        let custom_name = &s.display.channel_names[i];
-                        if !custom_name.is_empty() {
-                            ui.label(egui::RichText::new(custom_name).small());
-                        }
-                        let vol = s.levels.volumes[i];
-                        let muted = s.levels.mutes[i];
-                        let vol_text = if muted {
-                            egui::RichText::new(format!("{vol}%  MUTE"))
-                                .color(egui::Color32::RED)
-                                .strong()
-                        } else {
-                            egui::RichText::new(format!("{vol}%")).color(ACCENT[i])
-                        };
-                        ui.label(vol_text);
-
-                        ui.separator();
-
-                        if data.channel_items[i].is_empty() {
-                            ui.label(
-                                egui::RichText::new("—")
-                                    .color(egui::Color32::DARK_GRAY)
-                                    .italics(),
-                            );
-                        } else {
-                            for (idx, label, idle) in &data.channel_items[i] {
-                                let mut text = egui::RichText::new(label).size(12.0);
-                                if *idle {
-                                    text = text.color(egui::Color32::DARK_GRAY);
-                                }
-                                item_row(ui, label, text, |ui| {
-                                    if ui.small_button("✖").clicked() {
-                                        action = Some(Action::Unassign(*idx));
-                                    }
-                                });
-                            }
-                        }
-                    });
+                    channel_drop_column(&mut cols[i], i, &data.channel_items[i], &mut action);
                 }
             });
 
@@ -362,7 +432,7 @@ fn routing_ui(ui: &mut egui::Ui, s: &mut BeacnGui, data: &RoutingData, max_heigh
 
             ui.add_space(4.0);
 
-            // ── Two side-by-side lists: Apps and Mics ──
+            // ── Two side-by-side lists: Apps and Mics (drag sources) ──
             ui.columns(2, |cols| {
                 cols[0].heading("Apps");
                 assign_list(
@@ -382,7 +452,7 @@ fn routing_ui(ui: &mut egui::Ui, s: &mut BeacnGui, data: &RoutingData, max_heigh
             });
         });
 
-    // Apply any click after the lists have rendered: the indices in `data`
+    // Apply any click/drop after the lists have rendered: the indices in `data`
     // refer to `s.rows` as it was at the top of the frame, so mutate + refresh
     // only once nothing is iterating them anymore.
     if let Some(act) = action {
@@ -406,13 +476,73 @@ fn routing_ui(ui: &mut egui::Ui, s: &mut BeacnGui, data: &RoutingData, max_heigh
                     Err(e) => format!("Unassign failed: {e}"),
                 };
             }
+            Action::ToggleMute(i) => {
+                let muted = !s.levels.mutes[i];
+                s.status = match control::request(Command::SetMute { channel: i, muted }) {
+                    Ok(()) => format!("CH{} {}", i + 1, if muted { "muted" } else { "unmuted" }),
+                    Err(e) => format!("Mute failed: {e}"),
+                };
+            }
         }
         s.refresh();
     }
 }
 
-/// A scrollable list of unassigned items, each with CH1..CH4 assign buttons
-/// pinned to the right edge.
+/// One channel column: heading + mute toggle, then its assigned rows (each a
+/// drag source with an unassign ✖), all wrapped in a drop zone that accepts a
+/// dragged row index and assigns it to this channel.
+fn channel_drop_column(
+    ui: &mut egui::Ui,
+    i: usize,
+    items: &[(usize, String, bool)],
+    action: &mut Option<Action>,
+) {
+    let ch = Channel(i);
+    let frame = egui::Frame::default().inner_margin(egui::Margin::same(6));
+
+    let (_, payload) = ui.dnd_drop_zone::<usize, ()>(frame, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new(format!("CH{}", i + 1)).color(ACCENT[i]));
+                // Mute toggle. The icon reflects the *current* persisted state.
+                // (Read from the parent via the action queue keeps borrows
+                // simple: the button only enqueues a toggle.)
+                if ui.button("🔇").on_hover_text("Toggle mute").clicked() {
+                    *action = Some(Action::ToggleMute(i));
+                }
+            });
+
+            ui.separator();
+
+            if items.is_empty() {
+                ui.label(
+                    egui::RichText::new("—")
+                        .color(egui::Color32::DARK_GRAY)
+                        .italics(),
+                );
+            } else {
+                for (idx, label, idle) in items {
+                    let mut text = egui::RichText::new(label).size(12.0);
+                    if *idle {
+                        text = text.color(egui::Color32::DARK_GRAY);
+                    }
+                    draggable_row(ui, *idx, label, text, |ui| {
+                        if ui.small_button("✖").on_hover_text("Unassign").clicked() {
+                            *action = Some(Action::Unassign(*idx));
+                        }
+                    });
+                }
+            }
+        });
+    });
+
+    if let Some(idx) = payload {
+        *action = Some(Action::Assign(*idx, ch));
+    }
+}
+
+/// A scrollable list of unassigned items — each a drag source (drag onto a
+/// channel column) with CH1..CH4 assign buttons kept as a click fallback.
 fn assign_list(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -421,7 +551,7 @@ fn assign_list(
 ) {
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
-        .max_height(300.0)
+        .max_height(220.0)
         .show(ui, |ui| {
             if items.is_empty() {
                 ui.label(
@@ -432,7 +562,7 @@ fn assign_list(
             }
             for (idx, label) in items {
                 let text = egui::RichText::new(label).size(12.0);
-                item_row(ui, label, text, |ui| {
+                draggable_row(ui, *idx, label, text, |ui| {
                     // Right-to-left layout: add CH4 first so they read
                     // CH1..CH4 left-to-right.
                     for ch_i in (0..4).rev() {
@@ -446,10 +576,12 @@ fn assign_list(
 }
 
 // ── Settings tab ───────────────────────────────────────────────────────────
+// Unchanged from the original: Dim after / Full brightness / Dim brightness
+// sliders, output-device combo, per-channel names, and the background combo +
+// reload — all of which already drive the panel preview above through the same
+// config files.
 
 fn settings_ui(ui: &mut egui::Ui, s: &mut BeacnGui, max_height: f32) {
-    // Selections made inside the combo-box closures, applied afterwards so the
-    // closures only need shared borrows (no per-frame Vec clones).
     let mut chosen_output: Option<Option<String>> = None;
     let mut chosen_background: Option<Option<String>> = None;
     let mut any_name_focused = false;
@@ -556,8 +688,6 @@ fn settings_ui(ui: &mut egui::Ui, s: &mut BeacnGui, max_height: f32) {
                         if resp.has_focus() {
                             any_name_focused = true;
                         }
-                        // Commit on any loss of focus (Enter, Tab, clicking
-                        // away, ...) — never silently discard the edit.
                         if resp.lost_focus() {
                             let _ = s.display.save();
                             s.status = format!(

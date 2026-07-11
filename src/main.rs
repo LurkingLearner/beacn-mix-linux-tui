@@ -5,6 +5,7 @@
 //! the host as PipeWire null-sinks, and we map the hardware encoders onto their
 //! volumes. See README / plan for the full picture.
 
+mod control;
 #[cfg(feature = "gui")]
 mod gui;
 mod levels;
@@ -303,7 +304,7 @@ fn cmd_run() -> Result<()> {
 
     // Per-channel mic bindings: when a channel has one, its encoder rides that
     // capture device's gain/mute instead of the output sink. Re-read live below.
-    let mut mics = mic_bindings();
+    let mut mics = routing::mic_bindings();
 
     // Live level metering: capture each channel's monitor (or its bound mics)
     // and show a thin meter arc inside the volume gauge. Targets are re-pointed
@@ -319,6 +320,10 @@ fn cmd_run() -> Result<()> {
     for ch in Channel::ALL {
         apply_level(ch, &mics, volumes[ch.0], mutes[ch.0]);
     }
+
+    // GUI mute controls must go through this endpoint: `run` owns the live
+    // mute state and is responsible for applying it to PipeWire and the panel.
+    let control = control::Listener::bind()?;
 
     // Background: keep app streams routed to their bound channels.
     std::thread::spawn(auto_route_loop);
@@ -347,7 +352,7 @@ fn cmd_run() -> Result<()> {
     let mut background = load_background(&display);
     mix.as_ref().unwrap().init_display(display.full_brightness);
 
-    let mut sources = channel_sources(&mics);
+    let mut sources = routing::panel_sources(&mics);
     // Last levels drawn on the panel, quantized to LEVEL_STEPS — the meters
     // only mark the screen dirty when one of these actually changes.
     let mut shown_levels = [0u8; 4];
@@ -430,6 +435,27 @@ fn cmd_run() -> Result<()> {
                     }
                 }
             }
+        }
+
+        if let Err(e) = control.service(|command| match command {
+            control::Command::SetMute { channel, muted } => {
+                let Some(ch) = (channel < 4).then_some(Channel(channel)) else {
+                    anyhow::bail!("invalid channel {}", channel + 1);
+                };
+                mutes[ch.0] = muted;
+                set_channel_mute(ch, &mics, muted);
+                Levels { volumes, mutes }.save()?;
+                dirty = true;
+                levels_dirty = false;
+                log::info!(
+                    "channel {} {} from GUI",
+                    ch.human(),
+                    if muted { "muted" } else { "unmuted" }
+                );
+                Ok(())
+            }
+        }) {
+            log::warn!("control request failed: {e:#}");
         }
 
         let Some(mix_ref) = mix.as_ref() else {
@@ -537,7 +563,7 @@ fn cmd_run() -> Result<()> {
                     // Re-read mic bindings; if they changed (TUI assign/unassign),
                     // re-apply the channels' levels to their new targets so the
                     // newly-bound mic immediately tracks the saved gain/mute.
-                    let next_mics = mic_bindings();
+                    let next_mics = routing::mic_bindings();
                     if next_mics != mics {
                         mics = next_mics;
                         for ch in Channel::ALL {
@@ -548,7 +574,7 @@ fn cmd_run() -> Result<()> {
                         dirty = true;
                     }
 
-                    let next = channel_sources(&mics);
+                    let next = routing::panel_sources(&mics);
                     if next != sources {
                         sources = next;
                         dirty = true;
@@ -662,54 +688,6 @@ fn refresh_screen(
     mix.set_screen(&jpeg)
 }
 
-/// Per-channel source list for the panel, derived from **live routing** — the
-/// apps actually playing on each channel's sink — so two instances of the same
-/// app (e.g. two Firefox windows) each show on their own channel instead of
-/// colliding on one binding key. Falls back to the bound-but-idle app names when
-/// nothing is playing on a channel.
-fn channel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
-    let streams = pw::app_streams().unwrap_or_default();
-    let bindings = Bindings::load().unwrap_or_default();
-    // Resolve mic node names to friendly descriptions, but only pay for the
-    // `pactl list sources` call when at least one channel actually has a mic.
-    let source_list = if mics.iter().any(|m| !m.is_empty()) {
-        pw::list_sources().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    std::array::from_fn(|i| {
-        let ch = Channel(i);
-        // A mic channel shows its mics' names (the encoder rides all of them).
-        if !mics[i].is_empty() {
-            return mics[i]
-                .iter()
-                .map(|name| {
-                    source_list
-                        .iter()
-                        .find(|s| &s.name == name)
-                        .map(|s| s.label().to_string())
-                        .unwrap_or_else(|| name.clone())
-                })
-                .collect();
-        }
-        let live: Vec<String> = streams
-            .iter()
-            .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
-            .map(|s| panel_label(s).to_string())
-            .collect();
-        if live.is_empty() {
-            bindings.apps_for_channel(ch)
-        } else {
-            live
-        }
-    })
-}
-
-/// The per-channel mic bindings (channel -> the capture devices riding it).
-fn mic_bindings() -> [Vec<String>; 4] {
-    Bindings::load().unwrap_or_default().mics_array()
-}
-
 /// What each channel's level meter should capture: the bound mics when there
 /// are any (the meter then shows the loudest of them — i.e. you talking),
 /// otherwise the channel sink's monitor (the audio apps play into it).
@@ -769,23 +747,6 @@ fn set_channel_mute(ch: Channel, mics: &[Vec<String>; 4], mute: bool) {
 fn apply_level(ch: Channel, mics: &[Vec<String>; 4], volume: u32, mute: bool) {
     set_channel_volume(ch, mics, volume);
     set_channel_mute(ch, mics, mute);
-}
-
-/// Longest `media.name` we'll show in place of the app name on the panel. Above
-/// this it's a volatile tab title (e.g. a full video name), so we keep the app
-/// name instead of a truncated fragment.
-const PANEL_LABEL_MAX: usize = 13;
-
-/// What to print for a stream on the panel: a short, descriptive media name when
-/// the app gives one (e.g. "YouTube Music"), otherwise the app name. This lets
-/// two instances of the same app stay distinguishable when they happen to expose
-/// a clean media name, without churning on long page titles.
-fn panel_label(s: &pw::Stream) -> &str {
-    if !s.media.is_empty() && s.media != s.app && s.media.chars().count() <= PANEL_LABEL_MAX {
-        &s.media
-    } else {
-        &s.app
-    }
 }
 
 /// Periodically move newly-appeared app streams onto their bound channel.

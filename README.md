@@ -100,13 +100,6 @@ systemctl --user daemon-reload && systemctl --user enable --now beacn-mix.servic
 To update later: rebuild, `install -m755 target/release/beacn-mix ~/.local/bin/`,
 then `systemctl --user restart beacn-mix.service`.
 
-## Status / next steps
-
-Working: per-channel volume + mute from the encoders, runtime assignment + a
-routing TUI, the 800×480 gauge panel with optional custom background, and
-idle-resume screen wake. Not yet done (see `beacn-lib`'s `set_button_colour`):
-lighting the encoder rings.
-
 ## Credits
 
 - The UI font is [Rubik](https://github.com/googlefonts/rubik) by The Rubik

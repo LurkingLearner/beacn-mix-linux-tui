@@ -421,8 +421,8 @@ fn routing_ui(ui: &mut egui::Ui, s: &mut BeacnGui, data: &RoutingData, max_heigh
         .show(ui, |ui| {
             // ── Four channel drop-columns (aligned under the preview) ──
             ui.columns(4, |cols| {
-                for i in 0..4 {
-                    channel_drop_column(&mut cols[i], i, &data.channel_items[i], &mut action);
+                for (i, col) in cols.iter_mut().enumerate() {
+                    channel_drop_column(col, i, &data.channel_items[i], &mut action);
                 }
             });
 

@@ -326,6 +326,10 @@ pub struct DisplayConfig {
     /// or `None` for the solid colour. Cycled with ←/→ on the TUI Settings page.
     #[serde(default)]
     pub background_file: Option<String>,
+    /// Darken the selected backdrop so the panel overlays remain legible.
+    /// Defaults to enabled to preserve the appearance of existing configs.
+    #[serde(default = "default_background_scrim")]
+    pub background_scrim: bool,
     /// Bumped by the TUI to ask the daemon to reload the backdrop image from
     /// disk (the daemon loads it once at startup, so this is the on-demand
     /// "refresh background" signal — e.g. after overwriting the chosen file in
@@ -342,9 +346,14 @@ impl Default for DisplayConfig {
             dim_brightness: 12,
             channel_names: std::array::from_fn(|_| String::new()),
             background_file: None,
+            background_scrim: true,
             background_generation: 0,
         }
     }
+}
+
+const fn default_background_scrim() -> bool {
+    true
 }
 
 impl DisplayConfig {
@@ -559,6 +568,7 @@ mod tests {
             assert_eq!(d.dim_after_secs, 300);
             assert_eq!(d.full_brightness, 80);
             assert_eq!(d.dim_brightness, 12);
+            assert!(d.background_scrim);
             assert_eq!(d.background_generation, 0);
             for i in 0..4 {
                 assert_eq!(d.channel_label(i), format!("CH {}", i + 1));
@@ -586,6 +596,7 @@ mod tests {
             dim_brightness: 5,
             channel_names: std::array::from_fn(|i| format!("name{}", i)),
             background_file: Some("sunset.png".into()),
+            background_scrim: false,
             background_generation: 42,
         };
         with_paths(p.clone(), || original.save().expect("save"));
@@ -614,6 +625,7 @@ mod tests {
             assert_eq!(d.dim_after_secs, 600);
             assert_eq!(d.full_brightness, 90);
             assert_eq!(d.dim_brightness, 20);
+            assert!(d.background_scrim);
             assert_eq!(d.background_generation, 0);
             assert_eq!(d.background_file, None);
             for n in &d.channel_names {

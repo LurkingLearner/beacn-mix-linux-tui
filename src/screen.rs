@@ -85,16 +85,19 @@ pub struct ChannelView {
     pub level: f32,
 }
 
-/// Load a backdrop image, scaled to cover 800×480 and darkened for legibility.
+/// Load a backdrop image, scaled to cover 800×480 and optionally darkened for
+/// legibility.
 /// Returns `None` (and logs) on a missing/undecodable file so the caller falls
 /// back to the solid colour. Do this once and reuse it — decoding is not cheap.
-pub fn load_background(path: &Path) -> Option<RgbImage> {
+pub fn load_background(path: &Path, scrim: bool) -> Option<RgbImage> {
     match image::open(path) {
         Ok(img) => {
             let mut rgb = img.resize_to_fill(W, H, FilterType::Triangle).to_rgb8();
-            for px in rgb.pixels_mut() {
-                for c in px.0.iter_mut() {
-                    *c = (*c as f32 * SCRIM) as u8;
+            if scrim {
+                for px in rgb.pixels_mut() {
+                    for c in px.0.iter_mut() {
+                        *c = (*c as f32 * SCRIM) as u8;
+                    }
                 }
             }
             Some(rgb)

@@ -36,14 +36,16 @@ const ACCENT: [Color; 4] = [
 ];
 
 /// Settings rows: dim-after, full brightness, dim brightness, output device,
-/// 4 channel names, then the background-image row.
-const SETTINGS_FIELDS: usize = 9;
+/// 4 channel names, background-image, then its scrim toggle.
+const SETTINGS_FIELDS: usize = 10;
 /// Index of the output-device row (cycled with ←/→).
 const OUTPUT_FIELD: usize = 3;
 /// Index of the first channel-name row.
 const NAME_FIELD_BASE: usize = 4;
 /// Index of the background-image row (cycle files with ←/→, Enter to reload).
 const BACKGROUND_FIELD: usize = NAME_FIELD_BASE + 4;
+/// Index of the selected background's scrim toggle.
+const SCRIM_FIELD: usize = BACKGROUND_FIELD + 1;
 /// Max length of a custom channel name.
 const NAME_MAX: usize = 16;
 
@@ -468,10 +470,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     let field = app.settings.selected().unwrap_or(0);
     let is_name = (NAME_FIELD_BASE..BACKGROUND_FIELD).contains(&field);
     let is_background = field == BACKGROUND_FIELD;
+    let is_scrim = field == SCRIM_FIELD;
     let is_output = field == OUTPUT_FIELD;
-    // Numeric (adjustable) rows are everything that isn't a name, the output
-    // cycle, or the background row.
-    let is_numeric = !is_name && !is_background && !is_output;
+    // Numeric (adjustable) rows are everything that isn't a name, output,
+    // background, or scrim row.
+    let is_numeric = !is_name && !is_background && !is_scrim && !is_output;
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             app.settings.select(Some(field.saturating_sub(1)));
@@ -499,6 +502,15 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         KeyCode::Left | KeyCode::Char('h') if is_background => cycle_background(app, -1),
         KeyCode::Right | KeyCode::Char('l') if is_background => cycle_background(app, 1),
         KeyCode::Enter if is_background => request_background_reload(app),
+        KeyCode::Left
+        | KeyCode::Char('h')
+        | KeyCode::Right
+        | KeyCode::Char('l')
+        | KeyCode::Enter
+            if is_scrim =>
+        {
+            toggle_background_scrim(app)
+        }
         KeyCode::Enter if is_name => {
             app.editing = true;
             app.status = "Type a name · Backspace deletes · Enter/Esc done".to_string();
@@ -546,6 +558,23 @@ fn request_background_reload(app: &mut App) {
             Some(_) => "Reloading background — the daemon applies it within ~1s.".to_string(),
             None => "No background selected — using solid colour.".to_string(),
         },
+        Err(e) => format!("Save failed: {e}"),
+    };
+}
+
+/// Persist the backdrop scrim preference. The daemon reloads the current image
+/// when this value changes, so the panel updates without a restart.
+fn toggle_background_scrim(app: &mut App) {
+    app.display.background_scrim = !app.display.background_scrim;
+    app.status = match app.display.save() {
+        Ok(()) => format!(
+            "Background scrim {} (daemon applies within ~1s).",
+            if app.display.background_scrim {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         Err(e) => format!("Save failed: {e}"),
     };
 }
@@ -798,6 +827,14 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         None => "(off)".to_string(),
     };
     items.push(field_item("Background", format!("◂ {bg_label} ▸")));
+    items.push(field_item(
+        "Background scrim",
+        if d.background_scrim {
+            "on".to_string()
+        } else {
+            "off".to_string()
+        },
+    ));
     let list = List::new(items)
         .block(Block::bordered().title(" Panel display "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -810,6 +847,8 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
         "↑/↓ select · ←/→ change background · Enter reload · Tab routing · q quit".to_string()
     } else if sel == OUTPUT_FIELD {
         "↑/↓ select · ←/→ change output device · Tab routing · q quit".to_string()
+    } else if sel == SCRIM_FIELD {
+        "↑/↓ select · ←/→ or Enter toggle scrim · Tab routing · q quit".to_string()
     } else if sel >= NAME_FIELD_BASE {
         "↑/↓ select · Enter rename · Tab routing · q quit".to_string()
     } else {

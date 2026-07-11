@@ -150,7 +150,8 @@ fn cmd_preview(path: &str) -> Result<()> {
         },
     ];
     let display = DisplayConfig::load().unwrap_or_default();
-    let background = state::background_path_for(&display).and_then(|p| screen::load_background(&p));
+    let background = state::background_path_for(&display)
+        .and_then(|p| screen::load_background(&p, display.background_scrim));
     let jpeg = screen::render(&views, background.as_ref())?;
     std::fs::write(path, &jpeg).with_context(|| format!("writing {path}"))?;
     println!("Wrote sample panel ({} bytes) to {path}", jpeg.len());
@@ -347,7 +348,7 @@ fn cmd_run() -> Result<()> {
     let mut display = DisplayConfig::load().unwrap_or_default();
 
     // Optional backdrop image. Loaded once here, then reloaded on demand when the
-    // TUI cycles `DisplayConfig.background_file` or bumps `background_generation`
+    // Settings can change the backdrop, its scrim, or `background_generation`
     // (so a different / overwritten image is picked up without a restart).
     let mut background = load_background(&display);
     mix.as_ref().unwrap().init_display(display.full_brightness);
@@ -597,9 +598,10 @@ fn cmd_run() -> Result<()> {
 
                     let cfg = DisplayConfig::load().unwrap_or_default();
                     if cfg != display {
-                        // Reload the backdrop when the chosen file changes, or when
-                        // the TUI bumps the generation (overwrite-in-place reload).
+                        // Reload the backdrop when its file or scrim changes, or when
+                        // Settings bumps the generation (overwrite-in-place reload).
                         if cfg.background_file != display.background_file
+                            || cfg.background_scrim != display.background_scrim
                             || cfg.background_generation != display.background_generation
                         {
                             background = load_background(&cfg);
@@ -640,7 +642,7 @@ fn cmd_run() -> Result<()> {
 /// or the chosen file is missing/undecodable.
 fn load_background(display: &DisplayConfig) -> Option<RgbImage> {
     state::background_path_for(display).and_then(|p| {
-        let bg = screen::load_background(&p);
+        let bg = screen::load_background(&p, display.background_scrim);
         if bg.is_some() {
             log::info!("Using background image {}", p.display());
         }

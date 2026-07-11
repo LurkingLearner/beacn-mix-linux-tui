@@ -35,6 +35,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 /// Vertical space reserved below the tab content for the status bar.
 const STATUS_BAR_RESERVE: f32 = 30.0;
 
+/// Horizontal inset for the controls below the device-panel preview.
+const BODY_HORIZONTAL_PADDING: i8 = 12;
+
 // ── tabs ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -195,6 +198,7 @@ impl BeacnGui {
             self.panel_sources[i].hash(&mut h);
         }
         self.display.background_file.hash(&mut h);
+        self.display.background_scrim.hash(&mut h);
         self.display.background_generation.hash(&mut h);
         h.finish()
     }
@@ -204,8 +208,8 @@ impl BeacnGui {
         let sig = self.panel_signature();
         if self.panel_tex.is_none() || self.panel_sig != sig {
             let views = self.channel_views();
-            let bg =
-                state::background_path_for(&self.display).and_then(|p| screen::load_background(&p));
+            let bg = state::background_path_for(&self.display)
+                .and_then(|p| screen::load_background(&p, self.display.background_scrim));
             let img = screen::render_rgb(&views, bg.as_ref()).unwrap_or_else(|_| {
                 image::RgbImage::from_pixel(800, 480, image::Rgb([18, 20, 26]))
             });
@@ -261,16 +265,22 @@ impl eframe::App for BeacnGui {
             ui.separator();
 
             // ── Tab body: only the area below the preview switches ──
-            let body_height = (ui.available_height() - STATUS_BAR_RESERVE).max(60.0);
-            match self.tab {
-                Tab::Routing => {
-                    let data = routing_data(self);
-                    routing_ui(ui, self, &data, body_height);
-                }
-                Tab::Settings => {
-                    settings_ui(ui, self, body_height);
-                }
-            }
+            // Keep the controls clear of the window edge on both pages, while
+            // leaving the tabs, preview, and status bar full width.
+            egui::Frame::default()
+                .inner_margin(egui::Margin::symmetric(BODY_HORIZONTAL_PADDING, 0))
+                .show(ui, |ui| {
+                    let body_height = (ui.available_height() - STATUS_BAR_RESERVE).max(60.0);
+                    match self.tab {
+                        Tab::Routing => {
+                            let data = routing_data(self);
+                            routing_ui(ui, self, &data, body_height);
+                        }
+                        Tab::Settings => {
+                            settings_ui(ui, self, body_height);
+                        }
+                    }
+                });
 
             // ── Status bar ──
             ui.separator();
@@ -735,6 +745,24 @@ fn settings_ui(ui: &mut egui::Ui, s: &mut BeacnGui, max_height: f32) {
                                 "Reloading background — daemon applies it within ~1s.".to_string();
                         }
                     });
+                    ui.end_row();
+
+                    // ── Background scrim ──
+                    ui.label("Background scrim");
+                    if ui
+                        .checkbox(&mut s.display.background_scrim, "Darken for legibility")
+                        .changed()
+                    {
+                        let _ = s.display.save();
+                        s.status = format!(
+                            "Background scrim {} (daemon applies within ~1s).",
+                            if s.display.background_scrim {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                    }
                     ui.end_row();
                 });
 

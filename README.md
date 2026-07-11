@@ -69,11 +69,12 @@ applies them within ~1 s.
 ### Custom background
 
 Drop an image at `~/.config/beacn-mix-linux/background.{png,jpg,jpeg}` and the
-gauges are drawn over it (cover-scaled to 800×480 and darkened for legibility);
-remove it to go back to the solid colour. The daemon loads it once at startup —
+gauges are drawn over it (cover-scaled to 800×480 and darkened for legibility by
+default); remove it to go back to the solid colour. Toggle **Background scrim** in
+Settings to use the image at full brightness. The daemon loads it once at startup —
 after swapping the file, open `beacn-mix tui`, go to the **Settings** page, select
 **Reload background**, and press `Enter` to have the running daemon re-read it
-within ~1 s (no restart needed). Tune the darkening via `SCRIM` in `src/screen.rs`.
+within ~1 s (no restart needed).
 
 ## Permissions
 

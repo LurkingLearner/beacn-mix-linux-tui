@@ -167,13 +167,13 @@ pub fn mic_bindings() -> [Vec<String>; 4] {
     Bindings::load().unwrap_or_default().mics_array()
 }
 
-/// Per-channel labels for the device panel, derived from the same live routing
-/// rules the daemon uses. Channels with mics show only those mic names; the
-/// remaining channels show live stream labels, falling back to saved app
-/// bindings when idle.
+/// Per-channel labels for the device panel, derived from the current live
+/// routing state. Channels with mics show only those mic names; the remaining
+/// channels show only playback streams that are presently routed to them.
+/// Persisted-but-idle app bindings remain available to the routing UIs, but are
+/// deliberately omitted from the device panel.
 pub fn panel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
     let streams = pw::app_streams().unwrap_or_default();
-    let bindings = Bindings::load().unwrap_or_default();
     let source_list = if mics.iter().any(|m| !m.is_empty()) {
         pw::list_sources().unwrap_or_default()
     } else {
@@ -193,17 +193,17 @@ pub fn panel_sources(mics: &[Vec<String>; 4]) -> [Vec<String>; 4] {
                 })
                 .collect();
         }
-        let live: Vec<String> = streams
-            .iter()
-            .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
-            .map(|s| panel_label(s).to_string())
-            .collect();
-        if live.is_empty() {
-            bindings.apps_for_channel(ch)
-        } else {
-            live
-        }
+        live_panel_sources(&streams, ch)
     })
+}
+
+/// Labels for playback streams currently routed to one channel.
+fn live_panel_sources(streams: &[pw::Stream], ch: Channel) -> Vec<String> {
+    streams
+        .iter()
+        .filter(|s| pw::channel_of_sink(&s.sink) == Some(ch))
+        .map(|s| panel_label(s).to_string())
+        .collect()
 }
 
 /// Longest `media.name` we'll show in place of the app name on the panel.
@@ -214,5 +214,33 @@ fn panel_label(s: &pw::Stream) -> &str {
         &s.media
     } else {
         &s.app
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(app: &str, media: &str, sink: &str) -> pw::Stream {
+        pw::Stream {
+            index: 0,
+            app: app.to_string(),
+            media: media.to_string(),
+            sink: sink.to_string(),
+            owner_module: None,
+        }
+    }
+
+    #[test]
+    fn panel_sources_include_only_live_streams_on_the_channel() {
+        let streams = vec![
+            stream("Firefox", "Firefox", "BeacnCh1"),
+            stream("Spotify", "A song", "BeacnCh2"),
+            stream("Discord", "Discord", "other-sink"),
+        ];
+
+        assert_eq!(live_panel_sources(&streams, Channel(0)), vec!["Firefox"]);
+        assert_eq!(live_panel_sources(&streams, Channel(1)), vec!["A song"]);
+        assert!(live_panel_sources(&streams, Channel(2)).is_empty());
     }
 }

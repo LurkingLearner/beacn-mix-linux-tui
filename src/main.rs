@@ -36,6 +36,9 @@ const VOLUME_MAX: i32 = 150;
 /// meter that hasn't visibly moved never marks the screen dirty — a silent
 /// system keeps its throttled "no frames unless something changed" behaviour.
 const LEVEL_STEPS: u8 = 50;
+/// The panel can accept positioned JPEGs, so live meters update at 20 fps
+/// without repeatedly transferring the unchanged 800×480 frame.
+const PANEL_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
 /// How often to re-assert brightness + ping the device so the firmware keeps the
 /// panel lit (dim or full) and beacn-lib's own dimmer never fires.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -354,10 +357,10 @@ fn cmd_run() -> Result<()> {
     mix.as_ref().unwrap().init_display(display.full_brightness);
 
     let mut sources = routing::panel_sources(&mics);
-    // Last levels drawn on the panel, quantized to LEVEL_STEPS — the meters
-    // only mark the screen dirty when one of these actually changes.
+    // Last levels drawn on the panel, quantized to LEVEL_STEPS — only channels
+    // whose displayed level changed receive a new meter patch.
     let mut shown_levels = [0u8; 4];
-    let _ = refresh_screen(
+    let mut panel_base = match refresh_screen(
         mix.as_ref().unwrap(),
         &display,
         &sources,
@@ -366,15 +369,20 @@ fn cmd_run() -> Result<()> {
         &mics,
         &shown_levels,
         background.as_ref(),
-    );
-
+    ) {
+        Ok(base) => base,
+        Err(e) => {
+            log::warn!("initial screen push failed: {e:#}");
+            None
+        }
+    };
     log::info!(
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
     );
 
-    // Coalesce screen updates onto a ticker so fast knob spins don't flood the
-    // panel with full-frame JPEGs.
-    let ui = tick(Duration::from_millis(150));
+    // Coalesce state changes and update only the small meter regions at 20 fps.
+    // Structural changes still send one full base frame.
+    let ui = tick(PANEL_UPDATE_INTERVAL);
     let mut dirty = false;
     let mut levels_dirty = false;
     let mut ticks: u32 = 0;
@@ -412,7 +420,7 @@ fn cmd_run() -> Result<()> {
                         new_mix.init_display(brightness_for(screen, &display));
                         // Push a fresh frame so the panel is showing something,
                         // not the dim/black state the firmware left it in.
-                        if let Err(e) = refresh_screen(
+                        match refresh_screen(
                             &new_mix,
                             &display,
                             &sources,
@@ -422,7 +430,11 @@ fn cmd_run() -> Result<()> {
                             &shown_levels,
                             background.as_ref(),
                         ) {
-                            log::warn!("post-reconnect screen push failed: {e:#}");
+                            Ok(base) => panel_base = base,
+                            Err(e) => {
+                                panel_base = None;
+                                log::warn!("post-reconnect screen push failed: {e:#}");
+                            }
                         }
                         mix = Some(new_mix);
                         device_dead = false;
@@ -534,22 +546,57 @@ fn cmd_run() -> Result<()> {
                 // audio must not keep pushing frames to a dimmed panel, and
                 // level motion deliberately does not count as activity for
                 // the dim timer.
+                let mut changed_levels = [false; 4];
                 if screen == Screen::Active {
                     let next_levels = quantized_levels(&meter);
                     if next_levels != shown_levels {
+                        changed_levels = std::array::from_fn(|i| next_levels[i] != shown_levels[i]);
                         shown_levels = next_levels;
-                        dirty = true;
                     }
                 }
 
                 if dirty {
-                    if let Err(e) = refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, &shown_levels, background.as_ref()) {
-                        // Transport failure = the device is gone. Anything else
-                        // (e.g. a JPEG decoder hiccup) is logged inside refresh_screen.
-                        log::warn!("screen update failed: {e}");
-                        device_dead = true;
+                    match refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, &shown_levels, background.as_ref()) {
+                        Ok(base) => {
+                            panel_base = base;
+                            // The full frame already contains these meters, so
+                            // there is no need to enqueue duplicate patches.
+                            changed_levels = [false; 4];
+                        }
+                        Err(e) => {
+                            panel_base = None;
+                            log::warn!("screen update failed: {e}");
+                            device_dead = true;
+                        }
                     }
                     dirty = false;
+                }
+
+                if !device_dead {
+                    if let Some(base) = panel_base.as_ref() {
+                        for i in 0..4 {
+                            if !changed_levels[i] {
+                                continue;
+                            }
+                            match screen::render_meter_patch(
+                                base,
+                                i,
+                                shown_levels[i] as f32 / LEVEL_STEPS as f32,
+                                mutes[i],
+                            ) {
+                                Ok((x, y, jpeg)) => {
+                                    if let Err(e) = mix_ref.set_screen_region(x, y, &jpeg) {
+                                        log::warn!("meter patch update failed: {e}");
+                                        device_dead = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("meter patch render failed: {e}");
+                                }
+                            }
+                        }
+                    }
                 }
                 if levels_dirty {
                     let _ = Levels { volumes, mutes }.save();
@@ -560,7 +607,7 @@ fn cmd_run() -> Result<()> {
                 // Roughly once a second: re-poll routing (so panel labels track
                 // TUI assign/unassign) and re-read the display config (so Settings
                 // edits apply live). A routing change also counts as activity.
-                if ticks.is_multiple_of(7) {
+                if ticks.is_multiple_of(20) {
                     // Re-read mic bindings; if they changed (TUI assign/unassign),
                     // re-apply the channels' levels to their new targets so the
                     // newly-bound mic immediately tracks the saved gain/mute.
@@ -658,9 +705,8 @@ fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
     }
 }
 
-/// Build the four channel tiles from precomputed sources + current volumes/mutes
-/// and push them to the device. Returns `Err` only on transport failure (device
-/// gone) — a render failure is logged and treated as non-fatal.
+/// Build and push a full panel frame with the current meters already composited.
+/// The returned meter-free RGB image remains the base for later small patches.
 #[allow(clippy::too_many_arguments)]
 fn refresh_screen(
     mix: &Mix,
@@ -671,23 +717,42 @@ fn refresh_screen(
     mics: &[Vec<String>; 4],
     levels: &[u8; 4],
     background: Option<&RgbImage>,
-) -> Result<()> {
-    let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
+) -> Result<Option<RgbImage>> {
+    let base_views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
         label: display.channel_label(i),
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),
         is_mic: !mics[i].is_empty(),
-        level: levels[i] as f32 / LEVEL_STEPS as f32,
+        level: 0.0,
     });
-    let jpeg = match screen::render(&views, background) {
-        Ok(j) => j,
+    let base = match screen::render_rgb(&base_views, background) {
+        Ok(image) => image,
         Err(e) => {
             log::warn!("render failed: {e}");
-            return Ok(());
+            return Ok(None);
         }
     };
-    mix.set_screen(&jpeg)
+    let mut displayed_views = base_views;
+    for (i, view) in displayed_views.iter_mut().enumerate() {
+        view.level = levels[i] as f32 / LEVEL_STEPS as f32;
+    }
+    let displayed = match screen::render_rgb(&displayed_views, background) {
+        Ok(image) => image,
+        Err(e) => {
+            log::warn!("meter frame render failed: {e}");
+            return Ok(None);
+        }
+    };
+    let jpeg = match screen::encode_jpeg(&displayed) {
+        Ok(jpeg) => jpeg,
+        Err(e) => {
+            log::warn!("JPEG encode failed: {e}");
+            return Ok(None);
+        }
+    };
+    mix.set_screen(&jpeg)?;
+    Ok(Some(base))
 }
 
 /// What each channel's level meter should capture: the bound mics when there

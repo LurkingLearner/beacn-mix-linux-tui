@@ -19,13 +19,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Capture format: s16 mono at a low rate — plenty for peak metering, cheap on
-/// CPU. 100 ms of it is one metering window.
+/// CPU. 50 ms of it is one metering window, matching the panel update cadence.
 const SAMPLE_RATE: u32 = 12_000;
-const CHUNK_BYTES: usize = (SAMPLE_RATE as usize / 10) * 2; // 100 ms of s16 mono
+const CHUNK_BYTES: usize = (SAMPLE_RATE as usize / 20) * 2; // 50 ms of s16 mono
 
 /// Per-window decay: the published level is `max(window_peak, prev * DECAY)`,
-/// so a transient falls back smoothly (~0.75^n per 100 ms) instead of blinking.
-const DECAY: f32 = 0.75;
+/// so a transient falls back smoothly instead of blinking. This is sqrt(0.75),
+/// which preserves the previous decay rate now that windows arrive twice as
+/// often (0.866^2 ≈ 0.75 per 100 ms).
+const DECAY: f32 = 0.866_025_4;
 
 /// A meter whose reader hasn't delivered a window for this long reads as 0 —
 /// covers a capture that stalls without exiting (e.g. its source just died).
@@ -203,7 +205,10 @@ fn spawn_meter(shared: &Arc<Shared>, source: &str) -> std::io::Result<Meter> {
         .arg("--format=s16le")
         .arg(format!("--rate={SAMPLE_RATE}"))
         .arg("--channels=1")
-        .arg("--latency-msec=50")
+        // Ask Pulse to deliver data before a complete 50 ms meter window has
+        // accumulated; this avoids adding another full display interval of
+        // capture buffering ahead of the reader.
+        .arg("--latency-msec=25")
         // Label the stream so it's identifiable in pavucontrol & co.
         .env("PULSE_PROP", "application.name=beacn-mix-meter")
         .stdin(Stdio::null())
@@ -222,7 +227,7 @@ fn spawn_meter(shared: &Arc<Shared>, source: &str) -> std::io::Result<Meter> {
     })
 }
 
-/// Read 100 ms windows until EOF (child killed / source died), publishing the
+/// Read 50 ms windows until EOF (child killed / source died), publishing the
 /// smoothed peak after each one.
 fn reader_loop(mut stdout: ChildStdout, epoch: Instant, level: &AtomicU32, last_data: &AtomicU64) {
     let mut buf = [0u8; CHUNK_BYTES];

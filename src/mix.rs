@@ -128,6 +128,14 @@ impl Mix {
             .set_image(0, 0, jpeg)
             .map_err(|e| anyhow!("set_image failed: {e}"))
     }
+
+    /// Overlay a JPEG region at its panel coordinates. The firmware retains
+    /// the rest of the display, so this is suitable for live meter patches.
+    pub fn set_screen_region(&self, x: u32, y: u32, jpeg: &[u8]) -> Result<()> {
+        self.device
+            .set_image(x, y, jpeg)
+            .map_err(|e| anyhow!("set_image region failed: {e}"))
+    }
 }
 
 /// Logical channel 0..=3, matching the four faders/encoders left-to-right.

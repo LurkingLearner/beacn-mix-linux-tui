@@ -57,6 +57,15 @@ const METER_TH: i32 = 6;
 /// volume arc stays dominant.
 const METER_BLEND: f32 = 0.5;
 
+// The live meter is the only animated part of the panel. This 144×144 region
+// contains the entire meter ring with a generous margin, but remains inside
+// its 200 px column so it cannot overwrite a neighbouring tile or divider.
+// It is 16 px aligned because JPEG commonly uses 16×16 chroma MCUs; matching
+// the full-frame MCU grid avoids a visible re-encoding seam at patch edges.
+const METER_PATCH_W: u32 = 144;
+const METER_PATCH_H: u32 = 144;
+const JPEG_MCU: u32 = 16;
+
 // Label + source list below the gauge.
 const LABEL_Y: i32 = 196;
 const UNDERLINE_Y: i32 = 228;
@@ -114,10 +123,61 @@ pub fn load_background(path: &Path, scrim: bool) -> Option<RgbImage> {
 /// one a solid colour is used.
 pub fn render(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<Vec<u8>> {
     let img = render_rgb(views, background)?;
+    encode_jpeg(&img)
+}
+
+/// JPEG-encode an already-rendered panel image. Keeping this separate lets the
+/// caller retain the RGB base frame used to construct small live-meter patches.
+pub fn encode_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82);
-    enc.encode_image(&img)?;
+    enc.encode_image(img)?;
     Ok(buf)
+}
+
+/// Render a positioned JPEG patch for a channel's live meter over `base`.
+///
+/// `base` must contain the same static pixels as the most recent full frame,
+/// but with no live meters. Starting from it means a shorter/muted meter also
+/// cleanly erases the previous one without re-rendering or uploading the panel.
+pub fn render_meter_patch(
+    base: &RgbImage,
+    channel: usize,
+    level: f32,
+    muted: bool,
+) -> Result<(u32, u32, Vec<u8>)> {
+    if base.width() != W || base.height() != H {
+        return Err(anyhow!("meter patch base must be {W}x{H}"));
+    }
+    if channel >= COLS as usize {
+        return Err(anyhow!("invalid meter channel {channel}"));
+    }
+
+    // Round to the nearest JPEG MCU while keeping the patch in its own column.
+    let desired_x = channel as u32 * COL_W + COL_W / 2 - METER_PATCH_W / 2;
+    let x = ((desired_x + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
+    let desired_y = GAUGE_CY as u32 - METER_PATCH_H / 2;
+    let y = ((desired_y + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
+    let mut patch = image::imageops::crop_imm(base, x, y, METER_PATCH_W, METER_PATCH_H).to_image();
+
+    if !muted && level > 0.01 {
+        let center = (
+            (channel as u32 * COL_W + COL_W / 2 - x) as i32,
+            GAUGE_CY - y as i32,
+        );
+        let meter_end = GAUGE_START + level.clamp(0.0, 1.0) * GAUGE_SWEEP;
+        draw_arc(
+            &mut patch,
+            center,
+            METER_R,
+            METER_TH,
+            GAUGE_START,
+            meter_end,
+            blend(ACCENT[channel], FG, METER_BLEND),
+        );
+    }
+
+    Ok((x, y, encode_jpeg(&patch)?))
 }
 
 /// Same as [`render`] but returns the raw 800×480 RGB buffer instead of a JPEG.
@@ -753,6 +813,23 @@ mod tests {
             .to_rgb8();
         assert_eq!(decoded.width(), W);
         assert_eq!(decoded.height(), H);
+    }
+
+    #[test]
+    fn meter_patch_is_a_small_positioned_jpeg() {
+        let mut views = sample_views();
+        for view in &mut views {
+            view.level = 0.0;
+        }
+        let base = render_rgb(&views, None).expect("render base");
+        let (x, y, jpeg) = render_meter_patch(&base, 2, 0.75, false).expect("render patch");
+        let decoded = image::load_from_memory(&jpeg)
+            .expect("decode patch")
+            .to_rgb8();
+
+        assert_eq!((x, y), (432, 48));
+        assert_eq!(decoded.dimensions(), (METER_PATCH_W, METER_PATCH_H));
+        assert!(jpeg.len() < encode_jpeg(&base).expect("encode base").len());
     }
 
     // --- truncate -----------------------------------------------------------

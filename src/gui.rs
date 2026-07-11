@@ -48,7 +48,7 @@ enum Tab {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 760.0])
+            .with_inner_size([1000.0, 1200.0])
             .with_title("Beacn Mix — Routing"),
         ..Default::default()
     };
@@ -362,12 +362,14 @@ fn panel_preview(ui: &mut egui::Ui, s: &mut BeacnGui) {
     let avail = ui.available_width().min(800.0);
     let scale = (avail / 800.0).min(1.0);
     let sized = egui::load::SizedTexture::new(tex.id(), egui::vec2(800.0 * scale, 480.0 * scale));
-    ui.add(egui::Image::new(sized));
-    ui.label(
-        egui::RichText::new("This mirrors the panel bitmap the daemon sends to the hardware.")
-            .color(egui::Color32::GRAY)
-            .small(),
-    );
+    ui.vertical_centered(|ui| {
+        ui.add(egui::Image::new(sized));
+        ui.label(
+            egui::RichText::new("This mirrors the panel bitmap the daemon sends to the hardware.")
+                .color(egui::Color32::GRAY)
+                .small(),
+        );
+    });
 }
 
 // ── Routing tab ────────────────────────────────────────────────────────────

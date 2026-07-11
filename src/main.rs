@@ -36,9 +36,17 @@ const VOLUME_MAX: i32 = 150;
 /// meter that hasn't visibly moved never marks the screen dirty — a silent
 /// system keeps its throttled "no frames unless something changed" behaviour.
 const LEVEL_STEPS: u8 = 50;
-/// The panel can accept positioned JPEGs, so live meters update at 20 fps
-/// without repeatedly transferring the unchanged 800×480 frame.
+/// The panel can accept positioned JPEGs, so gauge changes (knob spins, mute
+/// toggles, live meters) update at 20 fps as small patches without repeatedly
+/// transferring the unchanged 800×480 frame.
 const PANEL_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+/// Minimum spacing between full 800×480 frames. The firmware cannot decode
+/// full frames quickly; pushing them faster than this makes it NAK, and the
+/// retry storm in the USB library permanently wedges the display until a hard
+/// power cycle. Structural changes therefore wait out this floor (falling
+/// through to cheap gauge patches so knobs stay responsive), and everything the
+/// user can spin/toggle repaints as a patch, never a full frame.
+const FULL_FRAME_MIN_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to re-assert brightness + ping the device so the firmware keeps the
 /// panel lit (dim or full) and beacn-lib's own dimmer never fires.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -380,10 +388,13 @@ fn cmd_run() -> Result<()> {
         "Mixer running. Turn an encoder to ride a channel; press it to mute. Ctrl-C to stop."
     );
 
-    // Coalesce state changes and update only the small meter regions at 20 fps.
-    // Structural changes still send one full base frame.
+    // Coalesce state changes and update only the small gauge regions at 20 fps.
+    // A structural change (`full_dirty`) sends one full base frame, but never
+    // more often than FULL_FRAME_MIN_INTERVAL; anything a knob/mute/meter can
+    // change goes out as a per-channel gauge patch (`gauge_dirty`).
     let ui = tick(PANEL_UPDATE_INTERVAL);
-    let mut dirty = false;
+    let mut full_dirty = false;
+    let mut gauge_dirty = [false; 4];
     let mut levels_dirty = false;
     let mut ticks: u32 = 0;
 
@@ -394,6 +405,9 @@ fn cmd_run() -> Result<()> {
     let mut last_activity = now;
     let mut last_liveness = now;
     let mut last_tick = now;
+    // When the last full 800×480 frame was pushed. Used to rate-floor full
+    // frames (see FULL_FRAME_MIN_INTERVAL) so we never wedge the firmware.
+    let mut last_full_frame = now;
     // Set when the event channel closes (device disconnected / host resume that
     // broke the USB handle) so the next loop iteration reconnects.
     let mut device_dead = false;
@@ -430,7 +444,10 @@ fn cmd_run() -> Result<()> {
                             &shown_levels,
                             background.as_ref(),
                         ) {
-                            Ok(base) => panel_base = base,
+                            Ok(base) => {
+                                panel_base = base;
+                                last_full_frame = now;
+                            }
                             Err(e) => {
                                 panel_base = None;
                                 log::warn!("post-reconnect screen push failed: {e:#}");
@@ -458,7 +475,7 @@ fn cmd_run() -> Result<()> {
                 mutes[ch.0] = muted;
                 set_channel_mute(ch, &mics, muted);
                 Levels { volumes, mutes }.save()?;
-                dirty = true;
+                gauge_dirty[ch.0] = true;
                 levels_dirty = false;
                 log::info!(
                     "channel {} {} from GUI",
@@ -490,7 +507,7 @@ fn cmd_run() -> Result<()> {
                             device_dead = true;
                         } else {
                             screen = Screen::Active;
-                            dirty = true;
+                            full_dirty = true;
                         }
                     }
 
@@ -501,7 +518,7 @@ fn cmd_run() -> Result<()> {
                             volumes[ch.0] = next as u32;
                             set_channel_volume(ch, &mics, volumes[ch.0]);
                             log::info!("channel {} -> {}%", ch.human(), volumes[ch.0]);
-                            dirty = true;
+                            gauge_dirty[ch.0] = true;
                             levels_dirty = true;
                         }
                         Interactions::ButtonPress(button, ButtonState::Press) => {
@@ -509,7 +526,7 @@ fn cmd_run() -> Result<()> {
                                 mutes[ch.0] = !mutes[ch.0];
                                 set_channel_mute(ch, &mics, mutes[ch.0]);
                                 log::info!("channel {} {}", ch.human(), if mutes[ch.0] { "muted" } else { "unmuted" });
-                                dirty = true;
+                                gauge_dirty[ch.0] = true;
                                 levels_dirty = true;
                             }
                         }
@@ -536,32 +553,43 @@ fn cmd_run() -> Result<()> {
                     } else {
                         screen = Screen::Active;
                         last_activity = now;
-                        dirty = true;
+                        full_dirty = true;
                     }
                 }
                 last_tick = now;
 
-                // Live meters: mark dirty only when a channel's *displayed*
+                // Live meters: dirty a channel's gauge only when its *displayed*
                 // (quantized) level moved, and never while dimmed — playing
-                // audio must not keep pushing frames to a dimmed panel, and
-                // level motion deliberately does not count as activity for
-                // the dim timer.
-                let mut changed_levels = [false; 4];
+                // audio must not keep pushing to a dimmed panel, and level motion
+                // deliberately does not count as activity for the dim timer.
                 if screen == Screen::Active {
                     let next_levels = quantized_levels(&meter);
                     if next_levels != shown_levels {
-                        changed_levels = std::array::from_fn(|i| next_levels[i] != shown_levels[i]);
+                        for i in 0..4 {
+                            if next_levels[i] != shown_levels[i] {
+                                gauge_dirty[i] = true;
+                            }
+                        }
                         shown_levels = next_levels;
                     }
                 }
 
-                if dirty {
+                // Full frame: only for structural changes, and never faster than
+                // the firmware can decode (see FULL_FRAME_MIN_INTERVAL) or the
+                // retry storm wedges the display. Inside the floor we leave
+                // `full_dirty` pending and fall through to gauge patches so knobs
+                // stay responsive.
+                if full_dirty
+                    && now.duration_since(last_full_frame) >= FULL_FRAME_MIN_INTERVAL
+                {
                     match refresh_screen(mix_ref, &display, &sources, &volumes, &mutes, &mics, &shown_levels, background.as_ref()) {
                         Ok(base) => {
                             panel_base = base;
-                            // The full frame already contains these meters, so
-                            // there is no need to enqueue duplicate patches.
-                            changed_levels = [false; 4];
+                            last_full_frame = now;
+                            full_dirty = false;
+                            // The full frame already contains every gauge, so no
+                            // patch is needed this pass.
+                            gauge_dirty = [false; 4];
                         }
                         Err(e) => {
                             panel_base = None;
@@ -569,33 +597,42 @@ fn cmd_run() -> Result<()> {
                             device_dead = true;
                         }
                     }
-                    dirty = false;
                 }
 
+                // Cheap per-channel gauge patches for knob/mute/meter changes.
                 if !device_dead {
+                    let mut clear_base = false;
                     if let Some(base) = panel_base.as_ref() {
                         for i in 0..4 {
-                            if !changed_levels[i] {
+                            if !gauge_dirty[i] {
                                 continue;
                             }
-                            match screen::render_meter_patch(
-                                base,
-                                i,
-                                shown_levels[i] as f32 / LEVEL_STEPS as f32,
-                                mutes[i],
-                            ) {
+                            let view = ChannelView {
+                                label: String::new(), // unused by the gauge
+                                volume: volumes[i],
+                                muted: mutes[i],
+                                apps: Vec::new(),
+                                is_mic: !mics[i].is_empty(),
+                                level: shown_levels[i] as f32 / LEVEL_STEPS as f32,
+                            };
+                            match screen::render_gauge_patch(base, i, &view) {
                                 Ok((x, y, jpeg)) => {
                                     if let Err(e) = mix_ref.set_screen_region(x, y, &jpeg) {
-                                        log::warn!("meter patch update failed: {e}");
+                                        log::warn!("gauge patch update failed: {e}");
                                         device_dead = true;
+                                        clear_base = true;
                                         break;
                                     }
+                                    gauge_dirty[i] = false;
                                 }
                                 Err(e) => {
-                                    log::warn!("meter patch render failed: {e}");
+                                    log::warn!("gauge patch render failed: {e}");
                                 }
                             }
                         }
+                    }
+                    if clear_base {
+                        panel_base = None;
                     }
                 }
                 if levels_dirty {
@@ -619,13 +656,13 @@ fn cmd_run() -> Result<()> {
                         }
                         // Re-point the level meters (mic gain vs. sink monitor).
                         meter.set_targets(meter_targets(&mics));
-                        dirty = true;
+                        full_dirty = true;
                     }
 
                     let next = routing::panel_sources(&mics);
                     if next != sources {
                         sources = next;
-                        dirty = true;
+                        full_dirty = true;
                         last_activity = now;
                         if screen == Screen::Dimmed {
                             if let Err(e) = mix_ref.wake(display.full_brightness) {
@@ -655,7 +692,7 @@ fn cmd_run() -> Result<()> {
                         }
                         display = cfg;
                         mix_ref.set_brightness(brightness_for(screen, &display));
-                        dirty = true; // names/background may have changed; redraw the panel
+                        full_dirty = true; // names/background may have changed; redraw the panel
                     }
                 }
 
@@ -705,8 +742,12 @@ fn brightness_for(screen: Screen, display: &DisplayConfig) -> u8 {
     }
 }
 
-/// Build and push a full panel frame with the current meters already composited.
-/// The returned meter-free RGB image remains the base for later small patches.
+/// Build and push a full panel frame with the current gauges (levels included)
+/// composited on. The returned gauge-free RGB **base** is retained as the origin
+/// for later small [`screen::render_gauge_patch`] updates.
+///
+/// A render/encode failure is non-fatal (`Ok(None)` — keep running, the panel
+/// just won't refresh this pass); only a transport failure is an `Err`.
 #[allow(clippy::too_many_arguments)]
 fn refresh_screen(
     mix: &Mix,
@@ -718,29 +759,27 @@ fn refresh_screen(
     levels: &[u8; 4],
     background: Option<&RgbImage>,
 ) -> Result<Option<RgbImage>> {
-    let base_views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
+    let views: [ChannelView; 4] = std::array::from_fn(|i| ChannelView {
         label: display.channel_label(i),
         volume: volumes[i],
         muted: mutes[i],
         apps: sources[i].clone(),
         is_mic: !mics[i].is_empty(),
-        level: 0.0,
+        level: levels[i] as f32 / LEVEL_STEPS as f32,
     });
-    let base = match screen::render_rgb(&base_views, background) {
+    // Render the base (no gauges) once, then composite the gauges for the full
+    // frame — the base is exactly what patches crop from later.
+    let base = match screen::render_base_rgb(&views, background) {
         Ok(image) => image,
         Err(e) => {
             log::warn!("render failed: {e}");
             return Ok(None);
         }
     };
-    let mut displayed_views = base_views;
-    for (i, view) in displayed_views.iter_mut().enumerate() {
-        view.level = levels[i] as f32 / LEVEL_STEPS as f32;
-    }
-    let displayed = match screen::render_rgb(&displayed_views, background) {
+    let displayed = match screen::composite_gauges(&base, &views) {
         Ok(image) => image,
         Err(e) => {
-            log::warn!("meter frame render failed: {e}");
+            log::warn!("gauge composite failed: {e}");
             return Ok(None);
         }
     };

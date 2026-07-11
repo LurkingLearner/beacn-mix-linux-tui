@@ -2,6 +2,16 @@
 //! (volume integer in the centre), the channel label with an accent underline,
 //! and the list of source apps grouped on that channel. The Mix decodes JPEG
 //! on-device, so we hand `beacn-lib`'s `set_image` a JPEG blob.
+//!
+//! Rendering is split into a **base** frame and **gauge patches** so the daemon
+//! rarely has to push a full 800×480 JPEG (which the firmware cannot decode
+//! quickly — flooding it wedges the panel). `render_base_rgb` draws everything
+//! *except* the gauges (divider, mic marker, label, underline, sources); it
+//! changes only on structural events and is retained by the daemon.
+//! `composite_gauges` overlays all four gauges onto a base for a full frame, and
+//! `render_gauge_patch` re-draws a single channel's gauge into a small 160×160
+//! positioned JPEG — the cheap update for knob spins, mute toggles and live
+//! meter motion.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{anyhow, Result};
@@ -57,13 +67,16 @@ const METER_TH: i32 = 6;
 /// volume arc stays dominant.
 const METER_BLEND: f32 = 0.5;
 
-// The live meter is the only animated part of the panel. This 144×144 region
-// contains the entire meter ring with a generous margin, but remains inside
-// its 200 px column so it cannot overwrite a neighbouring tile or divider.
-// It is 16 px aligned because JPEG commonly uses 16×16 chroma MCUs; matching
-// the full-frame MCU grid avoids a visible re-encoding seam at patch edges.
-const METER_PATCH_W: u32 = 144;
-const METER_PATCH_H: u32 = 144;
+// A gauge patch re-draws one channel's entire gauge (volume arc, live meter,
+// centre number or mute icon, dim track, 100% pip). This 160×160 region contains
+// all of it with margin — the volume band reaches r=71 and the pip r=78, and the
+// 16-px MCU alignment can shift the crop by ±4 px, so a smaller patch would clip
+// them — while staying inside the 200 px column so it cannot overwrite a
+// neighbouring tile or divider. It is 16 px aligned because JPEG commonly uses
+// 16×16 chroma MCUs; matching the full-frame MCU grid avoids a visible
+// re-encoding seam at patch edges.
+const GAUGE_PATCH_W: u32 = 160;
+const GAUGE_PATCH_H: u32 = 160;
 const JPEG_MCU: u32 = 16;
 
 // Label + source list below the gauge.
@@ -135,61 +148,96 @@ pub fn encode_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Render a positioned JPEG patch for a channel's live meter over `base`.
+/// The MCU-aligned crop rectangle `(x, y, w, h)` of a channel's gauge patch.
+/// Shared by [`render_gauge_patch`] and tests so the seam geometry is defined
+/// in exactly one place.
+pub fn gauge_patch_rect(channel: usize) -> (u32, u32, u32, u32) {
+    // Round to the nearest JPEG MCU while keeping the patch in its own column.
+    let desired_x = channel as u32 * COL_W + COL_W / 2 - GAUGE_PATCH_W / 2;
+    let x = ((desired_x + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
+    let desired_y = GAUGE_CY as u32 - GAUGE_PATCH_H / 2;
+    let y = ((desired_y + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
+    (x, y, GAUGE_PATCH_W, GAUGE_PATCH_H)
+}
+
+/// Render a positioned JPEG patch that re-draws one channel's whole gauge over
+/// `base`.
 ///
-/// `base` must contain the same static pixels as the most recent full frame,
-/// but with no live meters. Starting from it means a shorter/muted meter also
-/// cleanly erases the previous one without re-rendering or uploading the panel.
-pub fn render_meter_patch(
+/// `base` must contain the same static pixels as the most recent full frame but
+/// with no gauges (i.e. a [`render_base_rgb`] image). Starting from it means a
+/// lower volume, a stopped meter or a fresh mute cleanly erase whatever the
+/// gauge previously drew, without re-rendering or uploading the whole panel.
+/// `view.label` is unused (the gauge draws no text label).
+pub fn render_gauge_patch(
     base: &RgbImage,
     channel: usize,
-    level: f32,
-    muted: bool,
+    view: &ChannelView,
 ) -> Result<(u32, u32, Vec<u8>)> {
     if base.width() != W || base.height() != H {
-        return Err(anyhow!("meter patch base must be {W}x{H}"));
+        return Err(anyhow!("gauge patch base must be {W}x{H}"));
     }
     if channel >= COLS as usize {
-        return Err(anyhow!("invalid meter channel {channel}"));
+        return Err(anyhow!("invalid gauge channel {channel}"));
     }
+    let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
 
-    // Round to the nearest JPEG MCU while keeping the patch in its own column.
-    let desired_x = channel as u32 * COL_W + COL_W / 2 - METER_PATCH_W / 2;
-    let x = ((desired_x + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
-    let desired_y = GAUGE_CY as u32 - METER_PATCH_H / 2;
-    let y = ((desired_y + JPEG_MCU / 2) / JPEG_MCU) * JPEG_MCU;
-    let mut patch = image::imageops::crop_imm(base, x, y, METER_PATCH_W, METER_PATCH_H).to_image();
+    let (x, y, w, h) = gauge_patch_rect(channel);
+    let mut patch = image::imageops::crop_imm(base, x, y, w, h).to_image();
 
-    if !muted && level > 0.01 {
-        let center = (
-            (channel as u32 * COL_W + COL_W / 2 - x) as i32,
-            GAUGE_CY - y as i32,
-        );
-        let meter_end = GAUGE_START + level.clamp(0.0, 1.0) * GAUGE_SWEEP;
-        draw_arc(
-            &mut patch,
-            center,
-            METER_R,
-            METER_TH,
-            GAUGE_START,
-            meter_end,
-            blend(ACCENT[channel], FG, METER_BLEND),
-        );
-    }
+    // The gauge centre relative to the cropped patch's own origin.
+    let cx = (channel as u32 * COL_W + COL_W / 2) as i32 - x as i32;
+    let cy = GAUGE_CY - y as i32;
+    draw_gauge(&mut patch, &font, (cx, cy), view, ACCENT[channel]);
 
     Ok((x, y, encode_jpeg(&patch)?))
 }
 
 /// Same as [`render`] but returns the raw 800×480 RGB buffer instead of a JPEG.
 /// Useful for tests that want to inspect pixels (and a tiny bit cheaper for any
-/// future caller that needs the bitmap directly).
+/// future caller that needs the bitmap directly). Equivalent, by construction,
+/// to `composite_gauges(&render_base_rgb(views, background), views)`, but loads
+/// the font only once.
 pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Result<RgbImage> {
     let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
-    let mut img = match background {
+    let mut img = base_image(background);
+    draw_base(&mut img, &font, views);
+    draw_all_gauges(&mut img, &font, views);
+    Ok(img)
+}
+
+/// The panel base frame: everything *except* the gauges (column divider, mic
+/// marker, label, accent underline, sources list). The daemon retains this and
+/// re-draws only the gauges as small patches, so a full-frame push (this base
+/// plus gauges) is needed only when a structural element changes.
+pub fn render_base_rgb(
+    views: &[ChannelView; 4],
+    background: Option<&RgbImage>,
+) -> Result<RgbImage> {
+    let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
+    let mut img = base_image(background);
+    draw_base(&mut img, &font, views);
+    Ok(img)
+}
+
+/// Composite all four gauges onto a base produced by [`render_base_rgb`],
+/// yielding a full frame identical to [`render_rgb`].
+pub fn composite_gauges(base: &RgbImage, views: &[ChannelView; 4]) -> Result<RgbImage> {
+    let font = FontRef::try_from_slice(FONT_BYTES).map_err(|e| anyhow!("font load: {e}"))?;
+    let mut img = base.clone();
+    draw_all_gauges(&mut img, &font, views);
+    Ok(img)
+}
+
+/// The blank panel canvas: the background image (cloned) or the solid colour.
+fn base_image(background: Option<&RgbImage>) -> RgbImage {
+    match background {
         Some(bg) => bg.clone(),
         None => RgbImage::from_pixel(W, H, BG),
-    };
+    }
+}
 
+/// Draw the static (gauge-free) parts of every tile.
+fn draw_base(img: &mut RgbImage, font: &FontRef, views: &[ChannelView; 4]) {
     for (i, view) in views.iter().enumerate() {
         let x0 = i as u32 * COL_W;
         let accent = ACCENT[i];
@@ -197,21 +245,19 @@ pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Re
 
         // Column divider.
         if i > 0 {
-            draw_filled_rect_mut(&mut img, Rect::at(x0 as i32, 0).of_size(2, H), TRACK);
+            draw_filled_rect_mut(img, Rect::at(x0 as i32, 0).of_size(2, H), TRACK);
         }
-
-        draw_gauge(&mut img, &font, cx, view, accent);
 
         // Small mic marker above the gauge so input channels are recognisable
         // at a glance (the gauge centre still shows the live gain number).
         if view.is_mic {
-            draw_mic_icon(&mut img, cx, 18, 4, 6, accent, false);
+            draw_mic_icon(img, cx, 18, 4, 6, accent, false);
         }
 
         // Channel label + accent underline.
         centered(
-            &mut img,
-            &font,
+            img,
+            font,
             cx,
             LABEL_Y,
             23.0,
@@ -220,32 +266,39 @@ pub fn render_rgb(views: &[ChannelView; 4], background: Option<&RgbImage>) -> Re
         );
         let uw = 66u32;
         draw_filled_rect_mut(
-            &mut img,
+            img,
             Rect::at(cx - (uw / 2) as i32, UNDERLINE_Y).of_size(uw, 4),
             accent,
         );
 
-        draw_sources(&mut img, &font, cx, &view.apps);
+        draw_sources(img, font, cx, &view.apps);
     }
+}
 
-    Ok(img)
+/// Draw every channel's gauge at its full-frame centre.
+fn draw_all_gauges(img: &mut RgbImage, font: &FontRef, views: &[ChannelView; 4]) {
+    for (i, view) in views.iter().enumerate() {
+        let cx = (i as u32 * COL_W + COL_W / 2) as i32;
+        draw_gauge(img, font, (cx, GAUGE_CY), view, ACCENT[i]);
+    }
 }
 
 /// The arc gauge: dim track, accent fill to the current level, a 100% headroom
-/// pip, and either the volume integer or a mute icon in the centre.
-fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, accent: Rgb<u8>) {
+/// pip, and either the volume integer or a mute icon in the centre. Drawn around
+/// an explicit centre `(cx, cy)` so it can render either into the full frame (at
+/// `GAUGE_CY`) or into a cropped patch at the patch-relative centre.
+fn draw_gauge(
+    img: &mut RgbImage,
+    font: &FontRef,
+    center: (i32, i32),
+    view: &ChannelView,
+    accent: Rgb<u8>,
+) {
+    let (cx, cy) = center;
     let end = GAUGE_START + GAUGE_SWEEP;
 
     // Track (full sweep).
-    draw_arc(
-        img,
-        (cx, GAUGE_CY),
-        GAUGE_R,
-        GAUGE_TH,
-        GAUGE_START,
-        end,
-        TRACK,
-    );
+    draw_arc(img, (cx, cy), GAUGE_R, GAUGE_TH, GAUGE_START, end, TRACK);
 
     // Fill (0..level).
     let frac = (view.volume as f32 / VOLUME_MAX).clamp(0.0, 1.0);
@@ -254,7 +307,7 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
         let fill_end = GAUGE_START + frac * GAUGE_SWEEP;
         draw_arc(
             img,
-            (cx, GAUGE_CY),
+            (cx, cy),
             GAUGE_R,
             GAUGE_TH,
             GAUGE_START,
@@ -270,7 +323,7 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
         let meter_end = GAUGE_START + view.level.clamp(0.0, 1.0) * GAUGE_SWEEP;
         draw_arc(
             img,
-            (cx, GAUGE_CY),
+            (cx, cy),
             METER_R,
             METER_TH,
             GAUGE_START,
@@ -286,7 +339,7 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
         img,
         (
             (cx as f32 + pr * pip.cos()).round() as i32,
-            (GAUGE_CY as f32 + pr * pip.sin()).round() as i32,
+            (cy as f32 + pr * pip.sin()).round() as i32,
         ),
         2,
         DIM,
@@ -295,22 +348,14 @@ fn draw_gauge(img: &mut RgbImage, font: &FontRef, cx: i32, view: &ChannelView, a
     // Centre: mute icon, or the volume integer.
     if view.muted {
         if view.is_mic {
-            draw_mic_icon(img, cx, GAUGE_CY - 4, 6, 9, DIM, true);
+            draw_mic_icon(img, cx, cy - 4, 6, 9, DIM, true);
         } else {
-            draw_mute_icon(img, cx, GAUGE_CY);
+            draw_mute_icon(img, cx, cy);
         }
     } else {
         let s = format!("{}", view.volume);
         let px = 46.0;
-        centered(
-            img,
-            font,
-            cx,
-            (GAUGE_CY as f32 - px * 0.62) as i32,
-            px,
-            FG,
-            &s,
-        );
+        centered(img, font, cx, (cy as f32 - px * 0.62) as i32, px, FG, &s);
     }
 }
 
@@ -816,20 +861,137 @@ mod tests {
     }
 
     #[test]
-    fn meter_patch_is_a_small_positioned_jpeg() {
-        let mut views = sample_views();
-        for view in &mut views {
-            view.level = 0.0;
-        }
-        let base = render_rgb(&views, None).expect("render base");
-        let (x, y, jpeg) = render_meter_patch(&base, 2, 0.75, false).expect("render patch");
+    fn gauge_patch_is_a_small_positioned_jpeg() {
+        let views = sample_views();
+        let base = render_base_rgb(&views, None).expect("render base");
+        let (x, y, jpeg) = render_gauge_patch(&base, 2, &views[2]).expect("render patch");
         let decoded = image::load_from_memory(&jpeg)
             .expect("decode patch")
             .to_rgb8();
 
-        assert_eq!((x, y), (432, 48));
-        assert_eq!(decoded.dimensions(), (METER_PATCH_W, METER_PATCH_H));
-        assert!(jpeg.len() < encode_jpeg(&base).expect("encode base").len());
+        // Channel 2: desired_x = 420 → MCU-round to 416; desired_y = 36 → 32.
+        assert_eq!((x, y), (416, 32));
+        assert_eq!(decoded.dimensions(), (GAUGE_PATCH_W, GAUGE_PATCH_H));
+        // A full-frame JPEG (base + gauges) must be larger than a single patch.
+        let full = render_rgb(&views, None).expect("render full");
+        assert!(jpeg.len() < encode_jpeg(&full).expect("encode full").len());
+    }
+
+    #[test]
+    fn render_rgb_equals_composited_base_and_gauges() {
+        // Parity by construction: the full-frame path and the base+gauges path
+        // must yield pixel-identical images (guards against future drift).
+        let views = sample_views();
+        let full = render_rgb(&views, None).expect("render full");
+        let composited =
+            composite_gauges(&render_base_rgb(&views, None).expect("base"), &views).expect("comp");
+        assert_eq!(full.as_raw(), composited.as_raw(), "parity, solid bg");
+
+        // Same guarantee over a non-uniform background (the real deployment).
+        let bg = gradient_bg();
+        let full = render_rgb(&views, Some(&bg)).expect("render full bg");
+        let composited = composite_gauges(
+            &render_base_rgb(&views, Some(&bg)).expect("base bg"),
+            &views,
+        )
+        .expect("comp bg");
+        assert_eq!(full.as_raw(), composited.as_raw(), "parity, gradient bg");
+    }
+
+    #[test]
+    fn a_patch_repaints_everything_a_gauge_can_change() {
+        // The seam guarantee: any pixel that differs between the base (no gauges)
+        // and the full frame must lie inside that channel's 160×160 gauge patch
+        // rect. This proves a single patch fully repaints whatever a knob, meter
+        // or mute toggle can change — nothing bleeds outside the crop.
+        let extremes = [
+            ChannelView {
+                label: "x".into(),
+                volume: 150,
+                muted: false,
+                apps: vec![],
+                is_mic: false,
+                level: 1.0,
+            },
+            ChannelView {
+                label: "x".into(),
+                volume: 80,
+                muted: true,
+                apps: vec![],
+                is_mic: true,
+                level: 0.0,
+            },
+            ChannelView {
+                label: "x".into(),
+                volume: 80,
+                muted: true,
+                apps: vec![],
+                is_mic: false,
+                level: 0.0,
+            },
+        ];
+
+        for backdrop in [None, Some(gradient_bg())] {
+            for extreme in &extremes {
+                // Put the extreme view on every channel in turn.
+                for ch in 0..4 {
+                    let views: [ChannelView; 4] = std::array::from_fn(|i| {
+                        if i == ch {
+                            clone_view(extreme)
+                        } else {
+                            ChannelView {
+                                label: format!("CH {}", i + 1),
+                                volume: 40,
+                                muted: false,
+                                apps: vec![],
+                                is_mic: false,
+                                level: 0.0,
+                            }
+                        }
+                    });
+                    let base = render_base_rgb(&views, backdrop.as_ref()).expect("base");
+                    let full = render_rgb(&views, backdrop.as_ref()).expect("full");
+                    // Every channel draws a gauge, so check each differing pixel
+                    // against *its own column's* patch rect — this proves each
+                    // channel's gauge (the extreme one included) stays within
+                    // the patch that repaints it.
+                    for y in 0..H {
+                        for x in 0..W {
+                            if base.get_pixel(x, y) == full.get_pixel(x, y) {
+                                continue;
+                            }
+                            let col = (x / COL_W) as usize;
+                            let (px, py, pw, ph) = gauge_patch_rect(col);
+                            let inside = x >= px && x < px + pw && y >= py && y < py + ph;
+                            assert!(
+                                inside,
+                                "differing pixel ({x},{y}) outside ch {col} patch \
+                                 ({px},{py},{pw},{ph}); extreme on ch {ch}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A synthetic non-uniform background so parity/containment tests exercise
+    /// the real (image-backed) deployment path, not just the solid colour.
+    fn gradient_bg() -> RgbImage {
+        RgbImage::from_fn(W, H, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        })
+    }
+
+    fn clone_view(v: &ChannelView) -> ChannelView {
+        ChannelView {
+            label: v.label.clone(),
+            volume: v.volume,
+            muted: v.muted,
+            apps: v.apps.clone(),
+            is_mic: v.is_mic,
+            level: v.level,
+        }
     }
 
     // --- truncate -----------------------------------------------------------
